@@ -1,0 +1,65 @@
+---
+title: "Visão Geral"
+description: "Guia completo de implementação Kubernetes para ambiente de produção"
+---
+
+# Kubernetes em Produção
+
+Este guia documenta o fluxo completo de implementação de aplicações em Kubernetes para ambiente de produção, cobrindo desde o build da imagem Docker até a configuração de storage persistente.
+
+## Fluxo de Implementação
+
+<Steps>
+  <Step title="Build da Imagem Docker">
+    Construção da imagem da aplicação com as boas práticas de otimização para produção, incluindo multi-stage builds e uso correto de `.dockerignore`.
+  </Step>
+  <Step title="Push da Imagem">
+    Envio da imagem para um registry centralizado. São abordadas duas opções: **GitLab Container Registry** e **Registry Local (self-hosted)**.
+  </Step>
+  <Step title="Configuração de Storage no Kubernetes">
+    Provisionamento de volumes persistentes com `PersistentVolume`, `PersistentVolumeClaim` e `StorageClass` para garantir durabilidade dos dados.
+  </Step>
+</Steps>
+
+## Pré-requisitos
+
+Antes de iniciar, certifique-se que os seguintes recursos estão disponíveis:
+
+<CardGroup cols={2}>
+  <Card title="Docker" icon="docker">
+    Docker Engine instalado e funcionando na máquina de build. Versão recomendada: `24.x` ou superior.
+  </Card>
+  <Card title="kubectl" icon="terminal">
+    CLI do Kubernetes configurado com acesso ao cluster de produção via `kubeconfig`.
+  </Card>
+  <Card title="Acesso ao Registry" icon="lock">
+    Credenciais configuradas para o GitLab Container Registry **ou** para o registry local self-hosted.
+  </Card>
+  <Card title="Cluster Kubernetes" icon="server">
+    Cluster Kubernetes funcional com permissões para criar recursos como `PV`, `PVC` e `StorageClass`.
+  </Card>
+</CardGroup>
+
+## Tecnologias Utilizadas
+
+| Ferramenta       | Finalidade                                  |
+|------------------|---------------------------------------------|
+| Docker           | Build e empacotamento da aplicação          |
+| GitLab Registry  | Repositório centralizado de imagens (CI/CD) |
+| Docker Registry  | Registry local para ambientes isolados      |
+| Kubernetes       | Orquestração de containers em produção      |
+| kubectl          | CLI de gerenciamento do cluster             |
+
+## Navegação
+
+<CardGroup cols={3}>
+  <Card title="Build da Imagem" icon="hammer" href="/docker/build">
+    Como construir a imagem Docker com multi-stage build otimizado para produção.
+  </Card>
+  <Card title="Push para GitLab" icon="gitlab" href="/docker/push-gitlab">
+    Autenticação e envio da imagem para o GitLab Container Registry.
+  </Card>
+  <Card title="Push para Registry Local" icon="database" href="/docker/push-local-registry">
+    Configuração e uso de um registry Docker self-hosted.
+  </Card>
+</CardGroup>

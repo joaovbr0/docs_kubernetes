@@ -1,0 +1,290 @@
+---
+title: "Push para Registry Local (Self-Hosted)"
+description: "Como configurar e usar um registry Docker self-hosted para ambientes isolados ou on-premise"
+---
+
+# Push para Registry Local (Self-Hosted)
+
+Um **registry local** é uma instância do Docker Registry hospedada em sua própria infraestrutura. É ideal para ambientes isolados, redes sem acesso externo (air-gapped), ou quando se deseja controle total sobre as imagens sem depender de serviços externos como GitLab ou Docker Hub.
+
+## Opções de Registry Self-Hosted
+
+| Solução            | Descrição                                                         | Indicado para                  |
+|--------------------|-------------------------------------------------------------------|--------------------------------|
+| **Docker Registry v2** | Registry oficial minimalista da Docker, Inc.               | Ambientes simples, dev/lab     |
+| **Harbor**         | Registry empresarial com RBAC, scanning e replicação              | Produção enterprise            |
+| **Nexus OSS**      | Gerenciador de artefatos com suporte a Docker                     | Times com múltiplos artefatos  |
+| **Zot Registry**   | Registry OCI nativo, leve e focado em conformidade                | Produção e ambientes cloud     |
+
+Este guia foca no **Docker Registry v2** (mais simples) e no **Harbor** (recomendado para produção).
+
+---
+
+## Opção 1: Docker Registry v2
+
+### Subir o Registry com Docker Compose
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+
+services:
+  registry:
+    image: registry:2
+    container_name: docker-registry
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: "Docker Registry"
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/registry.crt
+      REGISTRY_HTTP_TLS_KEY: /certs/registry.key
+    volumes:
+      - registry-data:/var/lib/registry
+      - ./auth:/auth
+      - ./certs:/certs
+
+volumes:
+  registry-data:
+```
+
+### Gerar Credenciais htpasswd
+
+```bash
+# Instalar apache2-utils se necessário
+apt-get install -y apache2-utils
+
+# Criar o arquivo de senhas
+mkdir -p auth
+htpasswd -Bbn usuario senha > auth/htpasswd
+```
+
+### Gerar Certificado TLS (Self-Signed)
+
+```bash
+mkdir -p certs
+
+openssl req -newkey rsa:4096 -nodes -sha256 \
+  -keyout certs/registry.key \
+  -x509 -days 365 \
+  -out certs/registry.crt \
+  -subj "/CN=registry.empresa.local" \
+  -addext "subjectAltName=DNS:registry.empresa.local,IP:192.168.1.100"
+```
+
+<Warning>
+  Em produção, utilize um certificado emitido por uma CA confiável (Let's Encrypt, CA interna corporativa). Certificados self-signed requerem configuração adicional em todos os clientes Docker e no Kubernetes.
+</Warning>
+
+### Iniciar o Registry
+
+```bash
+docker compose up -d
+
+# Verificar se está rodando
+curl -k https://registry.empresa.local:5000/v2/_catalog
+```
+
+---
+
+## Opção 2: Harbor (Recomendado para Produção)
+
+O **Harbor** oferece autenticação, controle de acesso por projeto, escaneamento de vulnerabilidades (Trivy integrado) e replicação.
+
+### Instalar com Helm no Kubernetes
+
+```bash
+helm repo add harbor https://helm.goharbor.io
+helm repo update
+
+helm install harbor harbor/harbor \
+  --namespace harbor \
+  --create-namespace \
+  --set expose.type=ingress \
+  --set expose.ingress.hosts.core=harbor.empresa.local \
+  --set expose.tls.enabled=true \
+  --set externalURL=https://harbor.empresa.local \
+  --set harborAdminPassword=SenhaSegura123!
+```
+
+Após a instalação, acesse `https://harbor.empresa.local` e crie um projeto para suas imagens.
+
+---
+
+## Autenticação no Registry Local
+
+### Docker na máquina local
+
+```bash
+# Com TLS (produção)
+docker login registry.empresa.local:5000 \
+  --username usuario \
+  --password senha
+
+# Para registry sem TLS (apenas dev/lab), configure o daemon Docker
+# Adicione em /etc/docker/daemon.json:
+{
+  "insecure-registries": ["registry.empresa.local:5000"]
+}
+
+# Reiniciar o daemon Docker
+sudo systemctl restart docker
+```
+
+### Confiança no certificado self-signed
+
+Para que o Docker confie no certificado:
+
+```bash
+# Copiar o certificado para o diretório de CAs do Docker
+sudo mkdir -p /etc/docker/certs.d/registry.empresa.local:5000
+sudo cp certs/registry.crt /etc/docker/certs.d/registry.empresa.local:5000/ca.crt
+
+# Não é necessário reiniciar o Docker para certificados copiados assim
+```
+
+---
+
+## Build e Push para o Registry Local
+
+```bash
+# Variáveis de configuração
+REGISTRY="registry.empresa.local:5000"
+PROJECT="minha-app"
+IMAGE_TAG="1.0.0"
+COMMIT_HASH=$(git rev-parse --short HEAD)
+
+# Build com a tag apontando para o registry local
+docker build \
+  -t ${REGISTRY}/${PROJECT}:${IMAGE_TAG} \
+  -t ${REGISTRY}/${PROJECT}:main-${COMMIT_HASH} \
+  .
+
+# Push para o registry local
+docker push ${REGISTRY}/${PROJECT}:${IMAGE_TAG}
+docker push ${REGISTRY}/${PROJECT}:main-${COMMIT_HASH}
+
+# Verificar se a imagem foi enviada
+curl -sk \
+  -u usuario:senha \
+  https://${REGISTRY}/v2/${PROJECT}/tags/list
+```
+
+---
+
+## Configurar `imagePullSecret` no Kubernetes
+
+O Kubernetes precisa de credenciais para fazer pull de imagens de registries privados.
+
+### Criar o Secret
+
+```bash
+kubectl create secret docker-registry local-registry-secret \
+  --docker-server=registry.empresa.local:5000 \
+  --docker-username=usuario \
+  --docker-password=senha \
+  --docker-email=deploy@empresa.com \
+  --namespace=producao
+```
+
+### Configurar o certificado TLS no Kubernetes (self-signed)
+
+Se o registry usa certificado self-signed, é necessário distribuí-lo para todos os nós do cluster:
+
+```bash
+# Em cada nó do cluster (ou via DaemonSet)
+sudo mkdir -p /etc/docker/certs.d/registry.empresa.local:5000
+sudo cp registry.crt /etc/docker/certs.d/registry.empresa.local:5000/ca.crt
+
+# Para containerd (usado pela maioria dos clusters modernos)
+sudo mkdir -p /etc/containerd/certs.d/registry.empresa.local:5000
+cat > /etc/containerd/certs.d/registry.empresa.local:5000/hosts.toml << EOF
+server = "https://registry.empresa.local:5000"
+
+[host."https://registry.empresa.local:5000"]
+  ca = "/etc/containerd/certs.d/registry.empresa.local:5000/ca.crt"
+EOF
+
+sudo cp registry.crt /etc/containerd/certs.d/registry.empresa.local:5000/ca.crt
+sudo systemctl restart containerd
+```
+
+### Referenciar o Secret no Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minha-app
+  namespace: producao
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: minha-app
+  template:
+    metadata:
+      labels:
+        app: minha-app
+    spec:
+      imagePullSecrets:
+        - name: local-registry-secret    # <── Secret com as credenciais do registry local
+      containers:
+        - name: minha-app
+          image: registry.empresa.local:5000/minha-app:1.0.0
+          ports:
+            - containerPort: 3000
+```
+
+---
+
+## Distribuir o imagePullSecret via ServiceAccount
+
+Para não precisar declarar `imagePullSecrets` em cada Deployment, associe ao `ServiceAccount` padrão:
+
+```bash
+kubectl patch serviceaccount default \
+  -p '{"imagePullSecrets": [{"name": "local-registry-secret"}]}' \
+  --namespace=producao
+```
+
+---
+
+## Testar a Integração
+
+```bash
+# Criar um Pod de teste para verificar se o pull funciona
+kubectl run test-pull \
+  --image=registry.empresa.local:5000/minha-app:1.0.0 \
+  --namespace=producao \
+  --restart=Never
+
+# Verificar eventos do Pod (pull bem-sucedido ou erro)
+kubectl describe pod test-pull --namespace=producao
+
+# Remover o Pod de teste
+kubectl delete pod test-pull --namespace=producao
+```
+
+---
+
+## Comparativo: GitLab Registry vs Registry Local
+
+| Característica         | GitLab Registry                     | Registry Local                           |
+|------------------------|--------------------------------------|------------------------------------------|
+| Setup inicial          | Zero (integrado ao GitLab)          | Requer instalação e manutenção           |
+| Integração CI/CD       | Nativa com `.gitlab-ci.yml`          | Manual via scripts                       |
+| Acesso sem internet    | Não                                  | Sim                                      |
+| Custo de armazenamento | Incluso no plano GitLab              | Infraestrutura própria                   |
+| RBAC granular          | Por projeto GitLab                  | Harbor oferece RBAC completo             |
+| Scanning de imagens    | GitLab Ultimate                      | Harbor + Trivy (gratuito)                |
+| Recomendado para       | Times com GitLab já configurado      | Ambientes air-gapped, on-premise          |
+
+## Próximos Passos
+
+<Card title="Configurar Storage no Kubernetes" icon="hard-drive" href="/kubernetes/storage">
+  Configure volumes persistentes para garantir durabilidade dos dados da sua aplicação em produção.
+</Card>

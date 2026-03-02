@@ -1,0 +1,234 @@
+---
+title: "Push para GitLab Container Registry"
+description: "Como autenticar e enviar imagens Docker para o GitLab Container Registry"
+---
+
+# Push para GitLab Container Registry
+
+O **GitLab Container Registry** é o registry de imagens integrado ao GitLab. Ele permite armazenar e versionar imagens Docker diretamente associadas ao seu projeto, sem a necessidade de infraestrutura adicional.
+
+## Estrutura do Endereço do Registry
+
+O endereço do registry segue o padrão:
+
+```
+registry.gitlab.com/<namespace>/<projeto>/<nome-da-imagem>:<tag>
+```
+
+Exemplos:
+
+```
+registry.gitlab.com/minha-empresa/minha-app:1.0.0
+registry.gitlab.com/minha-empresa/backend/api:main-abc1234
+```
+
+## Autenticação Manual (Local)
+
+Para realizar push a partir da sua máquina local, você precisa se autenticar no registry do GitLab.
+
+### Opção 1: Usando seu usuário GitLab e Personal Access Token (PAT)
+
+<Steps>
+  <Step title="Gerar um Personal Access Token">
+    Acesse o GitLab em **Preferências do Usuário → Access Tokens** e crie um token com o escopo `read_registry` e `write_registry`.
+  </Step>
+  <Step title="Autenticar no Docker">
+    ```bash
+    docker login registry.gitlab.com \
+      --username <seu-usuario-gitlab> \
+      --password <seu-personal-access-token>
+    ```
+  </Step>
+  <Step title="Verificar autenticação">
+    ```bash
+    cat ~/.docker/config.json | grep registry.gitlab.com
+    ```
+    Se a autenticação foi bem-sucedida, você verá a entrada do registry no arquivo.
+  </Step>
+</Steps>
+
+<Warning>
+  Nunca use sua senha principal do GitLab para autenticação no Docker. Sempre utilize um **Personal Access Token** com escopos mínimos necessários.
+</Warning>
+
+### Opção 2: Usando Deploy Token
+
+Deploy Tokens são tokens de projeto com escopos limitados, ideais para pipelines e scripts de deploy:
+
+<Steps>
+  <Step title="Criar um Deploy Token">
+    No GitLab, acesse **Settings → Repository → Deploy Tokens** e crie um token com os escopos `read_registry` e `write_registry`.
+  </Step>
+  <Step title="Autenticar com o Deploy Token">
+    ```bash
+    docker login registry.gitlab.com \
+      --username <nome-do-deploy-token> \
+      --password <token-gerado>
+    ```
+  </Step>
+</Steps>
+
+## Build e Push Manual
+
+Com a autenticação configurada, realize o build e push com as tags corretas:
+
+```bash
+# Variáveis de configuração
+REGISTRY="registry.gitlab.com"
+NAMESPACE="minha-empresa"
+PROJECT="minha-app"
+IMAGE_TAG="1.0.0"
+COMMIT_HASH=$(git rev-parse --short HEAD)
+
+# Build da imagem
+docker build \
+  -t ${REGISTRY}/${NAMESPACE}/${PROJECT}:${IMAGE_TAG} \
+  -t ${REGISTRY}/${NAMESPACE}/${PROJECT}:main-${COMMIT_HASH} \
+  .
+
+# Push de todas as tags
+docker push ${REGISTRY}/${NAMESPACE}/${PROJECT}:${IMAGE_TAG}
+docker push ${REGISTRY}/${NAMESPACE}/${PROJECT}:main-${COMMIT_HASH}
+```
+
+## Integração com GitLab CI/CD
+
+O caso de uso mais comum é o push automático via pipeline. O GitLab CI injeta automaticamente as variáveis `CI_REGISTRY`, `CI_REGISTRY_USER` e `CI_REGISTRY_PASSWORD`.
+
+### `.gitlab-ci.yml` — Job de Build e Push
+
+```yaml
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE_TAG: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+
+build-image:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+  script:
+    - |
+      docker build \
+        --build-arg APP_VERSION=$CI_COMMIT_TAG \
+        -t $CI_REGISTRY_IMAGE:$IMAGE_TAG \
+        -t $CI_REGISTRY_IMAGE:latest \
+        .
+    - docker push $CI_REGISTRY_IMAGE:$IMAGE_TAG
+    - docker push $CI_REGISTRY_IMAGE:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+```
+
+<Tip>
+  Use `CI_REGISTRY_IMAGE` em vez de montar o endereço manualmente — o GitLab resolve automaticamente para `registry.gitlab.com/<namespace>/<projeto>`.
+</Tip>
+
+### Pipeline com Build Kaniko (sem Docker-in-Docker)
+
+Para clusters Kubernetes que não permitem Docker-in-Docker (DinD), use o **Kaniko**:
+
+```yaml
+build-image-kaniko:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.21.0-debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - |
+      echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n $CI_REGISTRY_USER:$CI_REGISTRY_PASSWORD | base64)\"}}}" \
+      > /kaniko/.docker/config.json
+    - |
+      /kaniko/executor \
+        --context $CI_PROJECT_DIR \
+        --dockerfile $CI_PROJECT_DIR/Dockerfile \
+        --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA \
+        --destination $CI_REGISTRY_IMAGE:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+```
+
+## Configurar `imagePullSecret` no Kubernetes
+
+Para que o Kubernetes consiga fazer pull das imagens privadas do GitLab, é necessário criar um `Secret` com as credenciais do registry.
+
+### Criar o Secret
+
+```bash
+kubectl create secret docker-registry gitlab-registry-secret \
+  --docker-server=registry.gitlab.com \
+  --docker-username=<deploy-token-usuario> \
+  --docker-password=<deploy-token-senha> \
+  --docker-email=deploy@empresa.com \
+  --namespace=producao
+```
+
+### Referenciar o Secret no Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minha-app
+  namespace: producao
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: minha-app
+  template:
+    metadata:
+      labels:
+        app: minha-app
+    spec:
+      imagePullSecrets:
+        - name: gitlab-registry-secret   # <── referência ao Secret criado
+      containers:
+        - name: minha-app
+          image: registry.gitlab.com/minha-empresa/minha-app:1.0.0
+          ports:
+            - containerPort: 3000
+```
+
+<Note>
+  Você também pode associar o `imagePullSecret` diretamente à `ServiceAccount` do namespace para que todos os Pods o utilizem automaticamente, sem precisar declarar em cada Deployment.
+</Note>
+
+### Associar à ServiceAccount (opcional, mas recomendado)
+
+```bash
+kubectl patch serviceaccount default \
+  -p '{"imagePullSecrets": [{"name": "gitlab-registry-secret"}]}' \
+  --namespace=producao
+```
+
+## Verificar Imagens no Registry
+
+No GitLab, acesse **Deploy → Container Registry** no seu projeto para visualizar, inspecionar e remover imagens armazenadas.
+
+```bash
+# Listar tags de uma imagem via CLI (requer autenticação)
+curl -s \
+  -H "Authorization: Bearer <token>" \
+  "https://registry.gitlab.com/v2/<namespace>/<projeto>/tags/list"
+```
+
+## Próximos Passos
+
+<CardGroup cols={2}>
+  <Card title="Push para Registry Local" icon="database" href="/docker/push-local-registry">
+    Alternativa self-hosted para ambientes isolados ou on-premise.
+  </Card>
+  <Card title="Configurar Storage" icon="hard-drive" href="/kubernetes/storage">
+    Configure volumes persistentes no Kubernetes para sua aplicação.
+  </Card>
+</CardGroup>

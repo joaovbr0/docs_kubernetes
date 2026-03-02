@@ -1,0 +1,360 @@
+---
+title: "Deployment"
+description: "Gerenciamento declarativo de Pods com rolling updates, rollbacks e estratégias de deploy"
+---
+
+# Deployment
+
+Um **Deployment** é a forma padrão de gerenciar aplicações stateless no Kubernetes. Ele declara o estado desejado — quantas réplicas, qual imagem, quais recursos — e o controller garante que esse estado seja mantido continuamente.
+
+Principais responsabilidades do Deployment:
+- Manter o número de réplicas desejado
+- Realizar atualizações sem downtime (**rolling update**)
+- Fazer rollback para versões anteriores
+- Substituir Pods com falha automaticamente
+
+## Manifesto Completo
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minha-app
+  namespace: producao
+  labels:
+    app: minha-app
+    version: "1.0.0"
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "API principal da aplicação"
+spec:
+  # ── Réplicas ─────────────────────────────────────────────────────
+  replicas: 3
+
+  # ── Seletor ──────────────────────────────────────────────────────
+  selector:
+    matchLabels:
+      app: minha-app         # Deve corresponder ao template.metadata.labels
+
+  # ── Estratégia de Atualização ────────────────────────────────────
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1       # Máximo de Pods indisponíveis durante o update
+      maxSurge: 1             # Máximo de Pods extras além do desejado
+
+  # ── Política de Revisões ─────────────────────────────────────────
+  revisionHistoryLimit: 5     # Mantém as últimas 5 revisões para rollback
+
+  # ── Progresso ────────────────────────────────────────────────────
+  progressDeadlineSeconds: 300   # Falha o deploy se não progredir em 5min
+
+  # ── Template do Pod ──────────────────────────────────────────────
+  template:
+    metadata:
+      labels:
+        app: minha-app
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      imagePullSecrets:
+        - name: gitlab-registry-secret
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+
+      # Distribui réplicas em nós diferentes para alta disponibilidade
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["minha-app"]
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: minha-app
+          image: registry.gitlab.com/empresa/minha-app:1.0.0
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 3000
+
+          envFrom:
+            - configMapRef:
+                name: app-config        # Carrega todas as chaves do ConfigMap
+            - secretRef:
+                name: app-secrets       # Carrega todos os segredos
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            failureThreshold: 30
+            periodSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3000
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            periodSeconds: 10
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      terminationGracePeriodSeconds: 30
+```
+
+## Estratégias de Deploy
+
+### RollingUpdate (padrão)
+
+Substitui os Pods gradualmente. Garante que sempre haja Pods disponíveis durante o update:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 25%    # Ou valor absoluto: 1
+    maxSurge: 25%          # Ou valor absoluto: 1
+```
+
+**Fluxo com 4 réplicas, maxUnavailable=1, maxSurge=1:**
+
+```
+Inicial:   [v1] [v1] [v1] [v1]
+Passo 1:   [v1] [v1] [v1] [v2]   ← sobe v2 (surge)
+Passo 2:   [v1] [v1] [v2] [v2]   ← desce um v1
+Passo 3:   [v1] [v2] [v2] [v2]
+Final:     [v2] [v2] [v2] [v2]
+```
+
+### Recreate
+
+Encerra todos os Pods antes de criar os novos. Causa **downtime**, mas útil quando a nova versão é incompatível com a anterior:
+
+```yaml
+strategy:
+  type: Recreate
+```
+
+## Atualizar o Deployment
+
+### Atualizar a imagem
+
+```bash
+# Forma direta via CLI
+kubectl set image deployment/minha-app \
+  minha-app=registry.gitlab.com/empresa/minha-app:1.1.0 \
+  --namespace=producao
+
+# Via manifesto (preferível em produção)
+# Edite o campo image no YAML e aplique:
+kubectl apply -f deployment.yaml
+```
+
+### Forçar reinício sem mudança de imagem (reload de ConfigMap, por exemplo)
+
+```bash
+kubectl rollout restart deployment/minha-app -n producao
+```
+
+### Acompanhar o progresso do deploy
+
+```bash
+# Aguarda o rollout completar (útil em CI/CD)
+kubectl rollout status deployment/minha-app -n producao
+
+# Ver histórico de revisões
+kubectl rollout history deployment/minha-app -n producao
+
+# Ver detalhes de uma revisão específica
+kubectl rollout history deployment/minha-app -n producao --revision=3
+```
+
+## Rollback
+
+```bash
+# Voltar para a revisão anterior
+kubectl rollout undo deployment/minha-app -n producao
+
+# Voltar para uma revisão específica
+kubectl rollout undo deployment/minha-app -n producao --to-revision=2
+
+# Verificar que o rollback foi concluído
+kubectl rollout status deployment/minha-app -n producao
+```
+
+## Escalar Manualmente
+
+```bash
+# Escalar réplicas via CLI (temporário — sobrescrito pelo manifesto)
+kubectl scale deployment/minha-app --replicas=5 -n producao
+
+# Escalar para zero (pausa a aplicação sem deletar o Deployment)
+kubectl scale deployment/minha-app --replicas=0 -n producao
+```
+
+<Tip>
+  Em produção, prefira usar HPA (Horizontal Pod Autoscaler) para escalonamento automático em vez de ajustar réplicas manualmente.
+</Tip>
+
+## PodDisruptionBudget (PDB)
+
+Garante disponibilidade mínima durante manutenções no cluster (drain de nó, upgrades):
+
+```yaml
+# pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-minha-app
+  namespace: producao
+spec:
+  minAvailable: 2          # Mínimo de Pods disponíveis (ou use maxUnavailable)
+  # maxUnavailable: 1      # Alternativa: máximo indisponível
+  selector:
+    matchLabels:
+      app: minha-app
+```
+
+```bash
+kubectl apply -f pdb.yaml
+kubectl get pdb -n producao
+```
+
+## Outros Tipos de Workload
+
+| Tipo           | Quando usar                                                         |
+|----------------|---------------------------------------------------------------------|
+| `Deployment`   | Aplicações stateless (APIs, frontends, workers)                     |
+| `StatefulSet`  | Aplicações stateful com identidade persistente (bancos, filas)      |
+| `DaemonSet`    | Um Pod por nó (agentes de monitoramento, log collectors, proxies)   |
+| `Job`          | Tarefas únicas que precisam completar com sucesso                   |
+| `CronJob`      | Tarefas agendadas (backups, relatórios, limpeza)                    |
+
+### DaemonSet — Exemplo
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-agent
+  namespace: monitoramento
+spec:
+  selector:
+    matchLabels:
+      app: log-agent
+  template:
+    metadata:
+      labels:
+        app: log-agent
+    spec:
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.0
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+```
+
+### CronJob — Exemplo
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-db
+  namespace: producao
+spec:
+  schedule: "0 2 * * *"         # Todo dia às 02:00
+  concurrencyPolicy: Forbid      # Não inicia novo job se o anterior ainda está rodando
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: registry.gitlab.com/empresa/db-backup:latest
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: db-secret
+                      key: url
+```
+
+## Comandos de Referência
+
+```bash
+# Listar Deployments
+kubectl get deployments -n producao
+
+# Detalhar um Deployment
+kubectl describe deployment minha-app -n producao
+
+# Ver os ReplicaSets gerenciados pelo Deployment
+kubectl get replicasets -n producao -l app=minha-app
+
+# Ver Pods com labels do Deployment
+kubectl get pods -n producao -l app=minha-app
+
+# Editar o Deployment interativamente
+kubectl edit deployment/minha-app -n producao
+
+# Pausar um rollout em andamento
+kubectl rollout pause deployment/minha-app -n producao
+
+# Retomar um rollout pausado
+kubectl rollout resume deployment/minha-app -n producao
+```

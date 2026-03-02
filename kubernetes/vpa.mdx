@@ -1,0 +1,287 @@
+---
+title: "Vertical Pod Autoscaler (VPA)"
+description: "Ajuste automático de CPU e memória dos containers com base no uso histórico real"
+---
+
+# Vertical Pod Autoscaler (VPA)
+
+O **VPA** (Vertical Pod Autoscaler) ajusta automaticamente os valores de `resources.requests` e `limits` dos containers com base no consumo histórico real. Em vez de adicionar mais Pods (como o HPA faz), ele dimensiona **os recursos de cada Pod individualmente**.
+
+```
+Sem VPA:   [Pod: cpu=250m, mem=256Mi]  ← definido manualmente e estático
+
+Com VPA:   [Pod: cpu=450m, mem=512Mi]  ← ajustado dinamicamente pelo VPA
+```
+
+## Diferença entre HPA e VPA
+
+| Característica      | HPA                                    | VPA                                      |
+|---------------------|----------------------------------------|------------------------------------------|
+| O que escala        | Número de réplicas (horizontal)        | Recursos de cada Pod (vertical)          |
+| Responde a          | Picos de carga em tempo real           | Padrão histórico de uso                  |
+| Reinicia os Pods    | Não                                    | Sim (para aplicar novos requests/limits) |
+| Ideal para          | Cargas variáveis e stateless            | Definir sizing correto de recursos       |
+| Escala para zero    | Não (mín. 1)                           | Não aplicável                            |
+
+<Warning>
+  **Não use HPA e VPA juntos no mesmo Deployment controlando CPU/memória**. Os dois entram em conflito. Se precisar de ambos, configure o VPA em modo `Off` ou `Initial` e use métricas customizadas no HPA (não CPU/memória padrão).
+</Warning>
+
+---
+
+## Instalação do VPA
+
+```bash
+# Clonar o repositório do VPA
+git clone https://github.com/kubernetes/autoscaler.git
+cd autoscaler/vertical-pod-autoscaler
+
+# Instalar os componentes do VPA
+./hack/vpa-up.sh
+
+# Ou via manifests
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/autoscaler/master/vertical-pod-autoscaler/deploy/vpa-v1-crd-gen.yaml
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/autoscaler/master/vertical-pod-autoscaler/deploy/vpa-rbac.yaml
+
+# Verificar instalação
+kubectl get pods -n kube-system | grep vpa
+```
+
+Os componentes instalados:
+
+| Componente            | Função                                                        |
+|-----------------------|---------------------------------------------------------------|
+| `vpa-recommender`     | Analisa histórico de uso e gera recomendações                |
+| `vpa-updater`         | Aplica recomendações reiniciando Pods quando necessário       |
+| `vpa-admission-controller` | Injeta requests/limits nos Pods no momento da criação   |
+
+---
+
+## Modos de Operação
+
+O VPA pode operar em quatro modos definidos pelo campo `updateMode`:
+
+| Modo         | Comportamento                                                               |
+|--------------|-----------------------------------------------------------------------------|
+| `Off`        | Apenas gera recomendações, **sem aplicar nada**. Excelente para diagnóstico |
+| `Initial`    | Aplica na **criação** do Pod, nunca reinicia Pods existentes                |
+| `Recreate`   | Aplica recriando Pods quando necessário (pode causar breve downtime)         |
+| `Auto`       | Aplica automaticamente — comportamento padrão e mais proativo               |
+
+---
+
+## VPA em modo `Off` — Apenas Recomendações
+
+O modo mais seguro para começar. Não altera nada, apenas mostra o que deveria ser configurado:
+
+```yaml
+# vpa-recommendation.yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: minha-app-vpa
+  namespace: producao
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minha-app
+  updatePolicy:
+    updateMode: "Off"       # Somente recomendações, sem aplicar
+```
+
+```bash
+kubectl apply -f vpa-recommendation.yaml
+
+# Ver as recomendações geradas
+kubectl describe vpa minha-app-vpa -n producao
+```
+
+Exemplo de saída:
+
+```yaml
+Recommendation:
+  Container Recommendations:
+    Container Name: minha-app
+    Lower Bound:        # Mínimo recomendado
+      cpu:    100m
+      memory: 200Mi
+    Target:             # Valor ideal recomendado
+      cpu:    450m
+      memory: 480Mi
+    Uncapped Target:    # Sem considerar limites do LimitRange
+      cpu:    450m
+      memory: 480Mi
+    Upper Bound:        # Máximo recomendado
+      cpu:    1200m
+      memory: 1Gi
+```
+
+<Tip>
+  Execute o VPA em modo `Off` por 7 a 14 dias antes de aplicar as recomendações. Isso garante que o histórico coletado cobre padrões de uso reais, incluindo picos periódicos.
+</Tip>
+
+---
+
+## VPA em modo `Auto` — Aplicação Automática
+
+```yaml
+# vpa-auto.yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: minha-app-vpa
+  namespace: producao
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minha-app
+  updatePolicy:
+    updateMode: "Auto"
+
+  # Limites globais de recursos (evita recomendações absurdas)
+  resourcePolicy:
+    containerPolicies:
+      - containerName: minha-app
+        minAllowed:
+          cpu: "100m"
+          memory: "128Mi"
+        maxAllowed:
+          cpu: "2"
+          memory: "4Gi"
+        controlledResources:
+          - cpu
+          - memory
+        controlledValues: RequestsAndLimits   # Ajusta requests e limits
+
+      # Container sidecar — apenas monitora, não ajusta
+      - containerName: log-shipper
+        mode: "Off"
+```
+
+---
+
+## VPA em modo `Initial` — Sizing na Criação
+
+Aplica as recomendações apenas quando um novo Pod é criado (útil para escalonamento via HPA):
+
+```yaml
+# vpa-initial.yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: minha-app-vpa
+  namespace: producao
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minha-app
+  updatePolicy:
+    updateMode: "Initial"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: minha-app
+        minAllowed:
+          cpu: "100m"
+          memory: "128Mi"
+        maxAllowed:
+          cpu: "2"
+          memory: "2Gi"
+```
+
+<Note>
+  O modo `Initial` é compatível com HPA baseado em métricas customizadas (não CPU/memória). O VPA define o sizing correto inicial, e o HPA gerencia o número de réplicas.
+</Note>
+
+---
+
+## Casos de Uso por Tipo de Workload
+
+### Serviços de alta disponibilidade (APIs, frontends)
+
+Use **HPA** para escalar réplicas e **VPA em modo `Off`** para coletar recomendações e ajustar manualmente de tempos em tempos:
+
+```yaml
+updateMode: "Off"    # Só recomenda, você aplica manualmente
+```
+
+### Jobs e CronJobs
+
+Use VPA em modo `Auto` — reinicializações são aceitáveis e o sizing correto reduz custo:
+
+```yaml
+updateMode: "Auto"
+```
+
+### StatefulSets (bancos de dados)
+
+Use VPA em modo `Initial` — evita reinicializações inesperadas de Pods com estado persistente:
+
+```yaml
+updateMode: "Initial"
+```
+
+### Workers e consumidores de fila
+
+Combine **KEDA** (escalonamento por fila) + **VPA em modo `Initial`**:
+- KEDA controla o número de réplicas
+- VPA garante que cada réplica tenha o sizing correto desde a criação
+
+---
+
+## Consultando Recomendações Programaticamente
+
+```bash
+# Ver recomendações em JSON
+kubectl get vpa minha-app-vpa -n producao -o json \
+  | jq '.status.recommendation.containerRecommendations'
+
+# Ver recomendações em YAML
+kubectl describe vpa minha-app-vpa -n producao
+
+# Ver todos os VPAs do cluster
+kubectl get vpa -A
+
+# Verificar se o admission-controller está interceptando os Pods
+kubectl get events -n producao | grep VPA
+```
+
+---
+
+## Limitações do VPA
+
+<AccordionGroup>
+  <Accordion title="Reinicia os Pods para aplicar recomendações">
+    Os modos `Auto` e `Recreate` reiniciam os Pods, o que pode causar breve indisponibilidade. Mitigue com múltiplas réplicas e `PodDisruptionBudget`.
+  </Accordion>
+  <Accordion title="Conflito com HPA em CPU/memória">
+    HPA e VPA controlando as mesmas métricas entram em loop. Se precisar de ambos, use HPA com métricas customizadas (RPS, fila) e VPA em modo `Initial`.
+  </Accordion>
+  <Accordion title="Histórico mínimo necessário">
+    O VPA precisa de histórico de uso para gerar recomendações precisas. As primeiras horas/dias podem ter recomendações pouco confiáveis.
+  </Accordion>
+  <Accordion title="Não funciona com réplicas únicas em produção">
+    Se o Deployment tem `replicas: 1`, uma reinicialização causa downtime total. Use sempre `minReplicas: 2` com HPA ou múltiplas réplicas fixas.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Fluxo Recomendado para Produção
+
+<Steps>
+  <Step title="Deploy inicial com valores estimados">
+    Defina `requests` e `limits` manualmente com estimativas iniciais razoáveis.
+  </Step>
+  <Step title="Ativar VPA em modo Off">
+    Crie o VPA em modo `Off` e deixe por 7-14 dias coletando dados reais de uso.
+  </Step>
+  <Step title="Analisar recomendações">
+    Execute `kubectl describe vpa` e compare as recomendações com os valores atuais. Ajuste manualmente os manifestos com os valores `Target` recomendados.
+  </Step>
+  <Step title="Decidir pelo modo de operação">
+    Para workloads stateless tolerantes a restart: mude para `Auto`. Para StatefulSets: use `Initial`. Para serviços críticos: mantenha `Off` e ajuste manualmente via GitOps.
+  </Step>
+</Steps>

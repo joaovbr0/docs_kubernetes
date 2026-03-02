@@ -1,0 +1,95 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "Kubernetes Production",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#0069ED",
+    "light": "#4D9CFF",
+    "dark": "#0050B4"
+  },
+  "topbarLinks": [
+    {
+      "name": "Suporte",
+      "url": "mailto:suporte@empresa.com"
+    }
+  ],
+  "topbarCtaButton": {
+    "name": "Dashboard",
+    "url": "https://dashboard.empresa.com"
+  },
+  "tabs": [
+    {
+      "name": "Guia de Implementação",
+      "url": "guides"
+    }
+  ],
+  "anchors": [
+    {
+      "name": "Documentação",
+      "icon": "book-open-cover",
+      "url": "https://mintlify.com/docs"
+    },
+    {
+      "name": "Kubernetes Docs",
+      "icon": "server",
+      "url": "https://kubernetes.io/docs"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Introdução",
+      "pages": [
+        "introducao"
+      ]
+    },
+    {
+      "group": "Docker",
+      "pages": [
+        "docker/build",
+        "docker/push-gitlab",
+        "docker/push-local-registry"
+      ]
+    },
+    {
+      "group": "Kubernetes — Workloads",
+      "pages": [
+        "kubernetes/namespace",
+        "kubernetes/pods",
+        "kubernetes/deployment",
+        "kubernetes/configmap-secret"
+      ]
+    },
+    {
+      "group": "Kubernetes — Rede",
+      "pages": [
+        "kubernetes/service",
+        "kubernetes/ingress"
+      ]
+    },
+    {
+      "group": "Kubernetes — Escalabilidade",
+      "pages": [
+        "kubernetes/hpa",
+        "kubernetes/vpa"
+      ]
+    },
+    {
+      "group": "Kubernetes — Segredos Externos",
+      "pages": [
+        "kubernetes/secrets-vault",
+        "kubernetes/secrets-conjur"
+      ]
+    },
+    {
+      "group": "Kubernetes — Storage",
+      "pages": [
+        "kubernetes/storage"
+      ]
+    }
+  ]
+  
+}

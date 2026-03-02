@@ -1,0 +1,332 @@
+---
+title: "Horizontal Pod Autoscaler (HPA)"
+description: "Escalonamento automático horizontal de Pods baseado em CPU, memória e métricas customizadas"
+---
+
+# Horizontal Pod Autoscaler (HPA)
+
+O **HPA** (Horizontal Pod Autoscaler) ajusta automaticamente o número de réplicas de um Deployment (ou StatefulSet) em resposta à demanda. Quando a carga aumenta, o HPA sobe réplicas; quando cai, desce — sempre respeitando os limites mínimo e máximo configurados.
+
+```
+Carga alta  ──► HPA aumenta réplicas  ──► [Pod] [Pod] [Pod] [Pod] [Pod]
+Carga baixa ──► HPA reduz réplicas   ──► [Pod] [Pod]
+```
+
+<Note>
+  O HPA requer que os Pods tenham `resources.requests` definidos. Sem isso, o Metrics Server não consegue calcular o percentual de uso e o HPA não funciona.
+</Note>
+
+## Pré-requisitos
+
+### Instalar o Metrics Server
+
+O HPA padrão (CPU/memória) depende do **Metrics Server**:
+
+```bash
+# Instalar via Helm
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm repo update
+
+helm install metrics-server metrics-server/metrics-server \
+  --namespace kube-system \
+  --set args[0]="--kubelet-insecure-tls"   # Necessário em clusters locais/dev
+
+# Verificar
+kubectl top nodes
+kubectl top pods -n producao
+```
+
+---
+
+## HPA v2 — CPU e Memória
+
+```yaml
+# hpa-basico.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: minha-app-hpa
+  namespace: producao
+spec:
+  # ── Alvo do escalonamento ────────────────────────────────────────
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minha-app
+
+  # ── Limites de réplicas ──────────────────────────────────────────
+  minReplicas: 2
+  maxReplicas: 10
+
+  # ── Métricas para o escalonamento ───────────────────────────────
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70      # Sobe réplicas se CPU médio > 70%
+
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80      # Sobe réplicas se Memória médio > 80%
+```
+
+```bash
+kubectl apply -f hpa-basico.yaml
+kubectl get hpa -n producao
+```
+
+---
+
+## Comportamento de Escalonamento (scaleUp/scaleDown)
+
+Por padrão, o HPA escala para cima rapidamente e desce devagar. O campo `behavior` permite customizar:
+
+```yaml
+# hpa-comportamento.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: minha-app-hpa
+  namespace: producao
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minha-app
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+  behavior:
+    # ── Escalonamento para cima ────────────────────────────────────
+    scaleUp:
+      stabilizationWindowSeconds: 30      # Aguarda 30s antes de escalar
+      policies:
+        - type: Pods
+          value: 4                          # Adiciona no máximo 4 Pods por vez
+          periodSeconds: 60
+        - type: Percent
+          value: 50                         # Ou 50% das réplicas atuais
+          periodSeconds: 60
+      selectPolicy: Max                     # Usa a política mais agressiva
+
+    # ── Escalonamento para baixo ───────────────────────────────────
+    scaleDown:
+      stabilizationWindowSeconds: 300     # Aguarda 5min antes de descer
+      policies:
+        - type: Pods
+          value: 2                          # Remove no máximo 2 Pods por vez
+          periodSeconds: 60
+      selectPolicy: Min                     # Usa a política mais conservadora
+```
+
+<Tip>
+  A janela de estabilização (`stabilizationWindowSeconds`) evita **flapping** — o HPA oscilando entre subir e descer réplicas rapidamente. Use valores maiores para `scaleDown` para evitar remover Pods prematuramente.
+</Tip>
+
+---
+
+## Métricas Customizadas
+
+Para escalar com base em métricas da aplicação (ex: requisições por segundo, tamanho de fila), use o **Prometheus Adapter** ou **KEDA**.
+
+### HPA com métricas customizadas via Prometheus Adapter
+
+```yaml
+# hpa-custom-metrics.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: minha-app-hpa-custom
+  namespace: producao
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: minha-app
+  minReplicas: 2
+  maxReplicas: 15
+  metrics:
+    # Métrica de recurso padrão (CPU)
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Métrica customizada: requisições HTTP por segundo por Pod
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "100"         # Escala se > 100 req/s por Pod
+
+    # Métrica externa: tamanho de uma fila SQS
+    - type: External
+      external:
+        metric:
+          name: sqs_queue_length
+          selector:
+            matchLabels:
+              queue: pedidos-producao
+        target:
+          type: AverageValue
+          averageValue: "50"          # Escala se fila > 50 mensagens por réplica
+```
+
+---
+
+## KEDA — Kubernetes Event-Driven Autoscaling
+
+O **KEDA** expande o HPA com suporte nativo a dezenas de fontes de eventos (Kafka, RabbitMQ, Redis, SQS, HTTP, etc.):
+
+```bash
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+helm install keda kedacore/keda --namespace keda --create-namespace
+```
+
+### ScaledObject — Escalar por fila Kafka
+
+```yaml
+# scaledobject-kafka.yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: consumer-scaler
+  namespace: producao
+spec:
+  scaleTargetRef:
+    name: kafka-consumer-deployment
+  minReplicaCount: 1
+  maxReplicaCount: 30
+  pollingInterval: 15       # Verifica a fila a cada 15s
+  cooldownPeriod: 60        # Aguarda 60s após última escala para descer
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-service.producao:9092
+        consumerGroup: pedidos-group
+        topic: pedidos
+        lagThreshold: "10"  # 1 Pod para cada 10 mensagens de lag
+        offsetResetPolicy: latest
+```
+
+### ScaledObject — Escalar por RabbitMQ
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scaler
+  namespace: producao
+spec:
+  scaleTargetRef:
+    name: worker-deployment
+  minReplicaCount: 0         # Permite escalar até zero (sem custo quando ocioso)
+  maxReplicaCount: 20
+  triggers:
+    - type: rabbitmq
+      metadata:
+        host: amqp://rabbitmq-service.producao:5672
+        queueName: email-notifications
+        queueLength: "5"     # 1 Pod para cada 5 mensagens na fila
+```
+
+<Note>
+  O KEDA permite escalar até **zero réplicas** (scale-to-zero), ideal para workers que só precisam estar ativos quando há mensagens. O HPA nativo não permite mínimo menor que 1.
+</Note>
+
+---
+
+## HPA + PodDisruptionBudget
+
+Combine HPA com PDB para garantir disponibilidade mínima durante o escalonamento para baixo:
+
+```yaml
+# pdb-com-hpa.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: minha-app-pdb
+  namespace: producao
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: minha-app
+```
+
+O HPA não removerá Pods abaixo do `minAvailable` definido no PDB.
+
+---
+
+## Monitorar o HPA
+
+```bash
+# Ver status do HPA
+kubectl get hpa -n producao
+
+# Saída detalhada (mostra métricas atuais e targets)
+kubectl describe hpa minha-app-hpa -n producao
+
+# Acompanhar em tempo real
+kubectl get hpa minha-app-hpa -n producao -w
+
+# Ver eventos de escalonamento
+kubectl describe hpa minha-app-hpa -n producao | grep -A 20 Events
+```
+
+Exemplo de saída do `kubectl get hpa`:
+
+```
+NAME             REFERENCE                 TARGETS         MINPODS   MAXPODS   REPLICAS
+minha-app-hpa    Deployment/minha-app      45%/70%         2         10        3
+```
+
+| Campo       | Significado                                              |
+|-------------|----------------------------------------------------------|
+| `TARGETS`   | `atual / alvo` — aqui CPU em 45%, alvo 70% (ok)         |
+| `MINPODS`   | Mínimo de réplicas                                       |
+| `MAXPODS`   | Máximo de réplicas                                       |
+| `REPLICAS`  | Réplicas ativas no momento                               |
+
+---
+
+## Boas Práticas
+
+<AccordionGroup>
+  <Accordion title="Sempre defina requests nos containers">
+    O HPA calcula percentual de uso baseado em `resources.requests`. Sem isso, o HPA mostra `unknown` e não escala.
+
+    ```yaml
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "256Mi"
+    ```
+  </Accordion>
+  <Accordion title="Use minReplicas >= 2 em produção">
+    Com apenas 1 réplica, qualquer problema (crash, restart) gera downtime total. Sempre configure pelo menos 2 réplicas mínimas.
+  </Accordion>
+  <Accordion title="Combine com PodAntiAffinity">
+    Distribua as réplicas em nós diferentes para maior resiliência a falhas de nó.
+  </Accordion>
+  <Accordion title="Calibre os targets com cuidado">
+    Targets muito altos (ex: 90% CPU) deixam pouca margem antes de degradar. Targets muito baixos causam escalonamento excessivo e custo desnecessário. Valores entre 60-75% são um bom ponto de partida.
+  </Accordion>
+</AccordionGroup>
