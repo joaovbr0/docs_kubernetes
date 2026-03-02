@@ -67,7 +67,10 @@
       "group": "Kubernetes — Rede",
       "pages": [
         "kubernetes/service",
-        "kubernetes/ingress"
+        "kubernetes/ingress",
+        "kubernetes/ingress-traefik",
+        "kubernetes/cert-manager",
+        "kubernetes/load-balancer-ip"
       ]
     },
     {

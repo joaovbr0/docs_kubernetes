@@ -1,0 +1,692 @@
+---
+title: "Ingress com Traefik"
+description: "Traefik como Ingress Controller no Kubernetes — roteamento, TLS automático, middlewares e dashboard"
+---
+
+# Traefik como Ingress Controller
+
+O **Traefik** é um reverse proxy e Ingress Controller cloud-native que se integra ao Kubernetes de forma dinâmica — detecta automaticamente Services e Ingresses sem necessidade de reload. Além do suporte ao recurso padrão `Ingress`, o Traefik expõe seus próprios CRDs (`IngressRoute`, `Middleware`, `TLSOption`) que oferecem controle mais granular sobre o roteamento.
+
+## Conceitos Fundamentais do Traefik
+
+```
+Tráfego externo
+      │
+      ▼
+ EntryPoint         ← porta de entrada (web:80, websecure:443)
+      │
+      ▼
+   Router           ← regra de roteamento (Host, PathPrefix, Headers...)
+      │
+   Middleware        ← transformações (auth, rate limit, redirect, headers...)
+      │
+      ▼
+   Service          ← balanceamento de carga para os Pods
+```
+
+| Conceito        | Equivalente NGINX         | Descrição                                              |
+|-----------------|---------------------------|--------------------------------------------------------|
+| `EntryPoint`    | `listen`                  | Porta de entrada do Traefik (80, 443, etc.)            |
+| `Router`        | `server_name` + `location`| Regra que combina tráfego a um serviço                 |
+| `Middleware`    | `ngx_http_*` modules      | Transformações aplicadas antes de chegar ao serviço    |
+| `Service`       | `upstream`                | Backend — aponta para os Pods                          |
+| `IngressRoute`  | `Ingress` resource        | CRD do Traefik para roteamento avançado                |
+
+---
+
+## Instalação via Helm
+
+```bash
+helm repo add traefik https://traefik.github.io/charts
+helm repo update
+
+helm install traefik traefik/traefik \
+  --namespace traefik \
+  --create-namespace \
+  --values traefik-values.yaml
+```
+
+### `traefik-values.yaml` — configuração completa para produção
+
+```yaml
+# traefik-values.yaml
+deployment:
+  replicas: 2
+
+# ── EntryPoints ─────────────────────────────────────────────────────
+ports:
+  web:
+    port: 80
+    redirectTo:
+      port: websecure       # Redireciona todo HTTP → HTTPS automaticamente
+  websecure:
+    port: 443
+    tls:
+      enabled: true
+  traefik:
+    port: 9000
+    expose:
+      default: false        # Não expõe o dashboard publicamente por padrão
+
+# ── TLS com Let's Encrypt ────────────────────────────────────────────
+additionalArguments:
+  - "--certificatesresolvers.letsencrypt.acme.email=devops@empresa.com.br"
+  - "--certificatesresolvers.letsencrypt.acme.storage=/data/acme.json"
+  - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+  # Alternativa: DNS challenge para certificados wildcard
+  # - "--certificatesresolvers.letsencrypt.acme.dnschallenge.provider=route53"
+
+# ── Logs ─────────────────────────────────────────────────────────────
+logs:
+  general:
+    level: INFO
+  access:
+    enabled: true
+    format: json
+    fields:
+      headers:
+        names:
+          User-Agent: keep
+          Authorization: redact     # Oculta o header de auth nos logs
+
+# ── Métricas Prometheus ──────────────────────────────────────────────
+metrics:
+  prometheus:
+    enabled: true
+    entryPoint: traefik
+
+# ── Provider Kubernetes ──────────────────────────────────────────────
+providers:
+  kubernetesIngress:
+    enabled: true
+    publishedService:
+      enabled: true
+  kubernetesCRD:
+    enabled: true
+    allowCrossNamespace: false   # Segurança: bloqueia referências entre namespaces
+    allowExternalNameServices: true
+
+# ── Dashboard interno ───────────────────────────────────────────────
+ingressRoute:
+  dashboard:
+    enabled: false              # Gerenciar via IngressRoute manualmente
+
+# ── RBAC ─────────────────────────────────────────────────────────────
+rbac:
+  enabled: true
+
+# ── Service de exposição ─────────────────────────────────────────────
+service:
+  type: LoadBalancer
+  annotations:
+    # AWS NLB
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+# ── Persistência para o acme.json (certificados) ────────────────────
+persistence:
+  enabled: true
+  storageClass: "ebs-gp3"
+  size: 128Mi
+  path: /data
+
+# ── Segurança ────────────────────────────────────────────────────────
+securityContext:
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+
+podSecurityContext:
+  fsGroup: 65532
+
+# ── Recursos ─────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+# ── Alta disponibilidade ─────────────────────────────────────────────
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values: ["traefik"]
+          topologyKey: kubernetes.io/hostname
+```
+
+```bash
+helm install traefik traefik/traefik \
+  --namespace traefik \
+  --create-namespace \
+  --values traefik-values.yaml
+
+kubectl get pods -n traefik
+kubectl get service -n traefik
+```
+
+---
+
+## Método 1: Recurso Ingress padrão (compatibilidade)
+
+O Traefik suporta o recurso `Ingress` nativo do Kubernetes, tornando a migração do NGINX transparente:
+
+```yaml
+# ingress-traefik-padrao.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minha-app-ingress
+  namespace: producao
+  annotations:
+    kubernetes.io/ingress.class: "traefik"
+    # TLS automático com Let's Encrypt
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: "letsencrypt"
+    # Middlewares aplicados a este ingress
+    traefik.ingress.kubernetes.io/router.middlewares: "producao-headers@kubernetescrd"
+spec:
+  rules:
+    - host: minha-app.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minha-app-service
+                port:
+                  number: 80
+```
+
+---
+
+## Método 2: IngressRoute (CRD nativo do Traefik)
+
+O `IngressRoute` é o CRD próprio do Traefik e oferece controle completo sobre roteamento, middlewares e TLS:
+
+### IngressRoute com TLS e middleware
+
+```yaml
+# ingressroute-minha-app.yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: minha-app
+  namespace: producao
+spec:
+  entryPoints:
+    - websecure           # Apenas HTTPS (porta 443)
+  routes:
+    - match: Host(`minha-app.empresa.com.br`)
+      kind: Rule
+      middlewares:
+        - name: security-headers
+          namespace: producao
+        - name: rate-limit
+          namespace: producao
+      services:
+        - name: minha-app-service
+          port: 80
+          weight: 1
+
+  tls:
+    certResolver: letsencrypt
+    domains:
+      - main: minha-app.empresa.com.br
+```
+
+### IngressRoute com roteamento por path
+
+```yaml
+# ingressroute-api-gateway.yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: api-gateway
+  namespace: producao
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    # Roteamento por path prefix
+    - match: Host(`api.empresa.com.br`) && PathPrefix(`/v1/users`)
+      kind: Rule
+      services:
+        - name: users-service
+          port: 80
+
+    - match: Host(`api.empresa.com.br`) && PathPrefix(`/v1/orders`)
+      kind: Rule
+      services:
+        - name: orders-service
+          port: 80
+
+    - match: Host(`api.empresa.com.br`) && PathPrefix(`/v1/payments`)
+      kind: Rule
+      middlewares:
+        - name: payment-auth       # Middleware extra para pagamentos
+      services:
+        - name: payments-service
+          port: 80
+
+    # Roteamento por header (ex: versão da API)
+    - match: Host(`api.empresa.com.br`) && HeadersRegexp(`X-API-Version`, `v2.*`)
+      kind: Rule
+      priority: 20                 # Maior priority tem precedência
+      services:
+        - name: api-v2-service
+          port: 80
+
+    # Fallback
+    - match: Host(`api.empresa.com.br`)
+      kind: Rule
+      priority: 1
+      services:
+        - name: api-v1-service
+          port: 80
+
+  tls:
+    certResolver: letsencrypt
+```
+
+### Sintaxe de regras disponíveis
+
+```
+Host(`exemplo.com`)
+HostRegexp(`{subdomain:[a-z]+}.empresa.com.br`)
+PathPrefix(`/api`)
+Path(`/health`)
+Method(`GET`, `POST`)
+Headers(`X-Custom-Header`, `valor`)
+HeadersRegexp(`X-Version`, `v[0-9]+`)
+Query(`debug`, `true`)
+ClientIP(`10.0.0.0/8`)
+
+# Operadores lógicos
+Host(`a.com`) && PathPrefix(`/api`)
+Host(`a.com`) || Host(`b.com`)
+!PathPrefix(`/admin`)
+```
+
+---
+
+## Middlewares
+
+Os middlewares são transformações que o Traefik aplica ao tráfego antes de encaminhar ao serviço.
+
+### Headers de segurança
+
+```yaml
+# middleware-security-headers.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+  namespace: producao
+spec:
+  headers:
+    # HTTPS
+    sslRedirect: true
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    stsPreload: true
+    forceSTSHeader: true
+    # Proteções de browser
+    contentTypeNosniff: true
+    browserXssFilter: true
+    frameDeny: true
+    # Remover headers que expõem informações do servidor
+    customResponseHeaders:
+      Server: ""
+      X-Powered-By: ""
+    # Headers customizados para o upstream
+    customRequestHeaders:
+      X-Real-IP: ""            # Traefik preenche com o IP real do cliente
+      X-Forwarded-Proto: "https"
+```
+
+### Rate limiting
+
+```yaml
+# middleware-rate-limit.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit
+  namespace: producao
+spec:
+  rateLimit:
+    average: 100       # 100 req/s em média
+    burst: 200         # Permite burst de até 200 req/s
+    period: 1s
+    sourceCriterion:
+      ipStrategy:
+        depth: 1       # Usa o IP do cliente direto (ou depth > 1 atrás de proxy)
+```
+
+### Redirect HTTP → HTTPS
+
+```yaml
+# middleware-https-redirect.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: https-redirect
+  namespace: traefik
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true    # 301 Permanent Redirect
+```
+
+### Compressão gzip
+
+```yaml
+# middleware-compress.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: compress
+  namespace: producao
+spec:
+  compress:
+    excludedContentTypes:
+      - text/event-stream
+    minResponseBodyBytes: 1024
+```
+
+### Autenticação Basic Auth
+
+```yaml
+# middleware-basic-auth.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: admin-auth
+  namespace: producao
+spec:
+  basicAuth:
+    secret: admin-auth-secret    # Secret com usuários/senhas htpasswd
+    realm: "Area Restrita"
+    removeHeader: true           # Remove o header Authorization antes de encaminhar
+---
+# Secret com credenciais htpasswd
+# Gerar: htpasswd -nb admin senhasecreta
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admin-auth-secret
+  namespace: producao
+type: Opaque
+stringData:
+  users: "admin:$apr1$xyz..."    # Hash gerado pelo htpasswd
+```
+
+### Forward Auth — autenticação delegada
+
+```yaml
+# middleware-forward-auth.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: oauth2-auth
+  namespace: producao
+spec:
+  forwardAuth:
+    address: "http://oauth2-proxy.producao.svc.cluster.local:4180/oauth2/auth"
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-Auth-User
+      - X-Auth-Email
+      - X-Auth-Groups
+```
+
+### Reescrita de path (StripPrefix)
+
+```yaml
+# middleware-strip-prefix.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-api-prefix
+  namespace: producao
+spec:
+  stripPrefix:
+    prefixes:
+      - /api/v1           # Remove /api/v1 antes de encaminhar ao serviço
+    forceSlash: true
+```
+
+Combinando com IngressRoute:
+
+```yaml
+routes:
+  - match: Host(`api.empresa.com.br`) && PathPrefix(`/api/v1/users`)
+    kind: Rule
+    middlewares:
+      - name: strip-api-prefix   # /api/v1/users → /users no serviço
+    services:
+      - name: users-service
+        port: 80
+```
+
+### Encadeamento de middlewares (Middleware Chain)
+
+```yaml
+# middleware-chain.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: default-chain
+  namespace: producao
+spec:
+  chain:
+    middlewares:
+      - name: https-redirect
+        namespace: traefik
+      - name: security-headers
+        namespace: producao
+      - name: compress
+        namespace: producao
+      - name: rate-limit
+        namespace: producao
+```
+
+---
+
+## TLS Avançado
+
+### TLSOption — configurar versão mínima e cifras
+
+```yaml
+# tlsoption-producao.yaml
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: tls-producao
+  namespace: producao
+spec:
+  minVersion: VersionTLS12
+  maxVersion: VersionTLS13
+  cipherSuites:
+    - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    - TLS_AES_256_GCM_SHA384
+    - TLS_CHACHA20_POLY1305_SHA256
+  sniStrict: true             # Rejeita conexões sem SNI correspondente
+  clientAuth:                 # mTLS — opcional
+    secretNames:
+      - client-ca-cert
+    clientAuthType: RequireAndVerifyClientCert
+```
+
+Referenciar no IngressRoute:
+
+```yaml
+spec:
+  tls:
+    certResolver: letsencrypt
+    options:
+      name: tls-producao
+      namespace: producao
+```
+
+### Certificado TLS manual (sem Let's Encrypt)
+
+```bash
+kubectl create secret tls minha-app-tls-cert \
+  --cert=./certs/minha-app.crt \
+  --key=./certs/minha-app.key \
+  --namespace=producao
+```
+
+```yaml
+spec:
+  tls:
+    secretName: minha-app-tls-cert    # Em vez de certResolver
+```
+
+---
+
+## Canary Deployment com Traefik
+
+Distribuição de tráfego ponderada entre duas versões da aplicação:
+
+```yaml
+# ingressroute-canary.yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: minha-app-canary
+  namespace: producao
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`minha-app.empresa.com.br`)
+      kind: Rule
+      services:
+        - name: minha-app-v1-service    # Versão estável
+          port: 80
+          weight: 90                    # 90% do tráfego
+        - name: minha-app-v2-service    # Canary
+          port: 80
+          weight: 10                    # 10% do tráfego
+  tls:
+    certResolver: letsencrypt
+```
+
+---
+
+## Dashboard do Traefik
+
+Expor o dashboard com autenticação segura:
+
+```yaml
+# ingressroute-dashboard.yaml
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: traefik-dashboard
+  namespace: traefik
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`traefik.empresa.com.br`) && (PathPrefix(`/dashboard`) || PathPrefix(`/api`))
+      kind: Rule
+      middlewares:
+        - name: admin-auth
+          namespace: producao
+        - name: security-headers
+          namespace: producao
+      services:
+        - name: api@internal    # Serviço interno do Traefik
+          kind: TraefikService
+  tls:
+    certResolver: letsencrypt
+```
+
+<Warning>
+  Nunca exponha o dashboard do Traefik sem autenticação. Use Basic Auth, Forward Auth ou restrinja por IP com o middleware `ipWhiteList`.
+</Warning>
+
+---
+
+## Traefik com IngressClass
+
+Quando há mais de um Ingress Controller no cluster, use `IngressClass` para distingui-los:
+
+```yaml
+# ingressclass-traefik.yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: traefik
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "false"
+spec:
+  controller: traefik.io/ingress-controller
+```
+
+```yaml
+# Referenciar no recurso Ingress padrão
+spec:
+  ingressClassName: traefik
+```
+
+---
+
+## Verificação e Debugging
+
+```bash
+# Ver pods e serviço do Traefik
+kubectl get pods -n traefik
+kubectl get service -n traefik
+
+# Listar IngressRoutes
+kubectl get ingressroute -n producao
+kubectl get ingressroute -A
+
+# Listar Middlewares
+kubectl get middleware -n producao
+
+# Descrever um IngressRoute
+kubectl describe ingressroute minha-app -n producao
+
+# Ver logs do Traefik em tempo real
+kubectl logs -n traefik -l app.kubernetes.io/name=traefik -f
+
+# Verificar logs de acesso (JSON)
+kubectl logs -n traefik -l app.kubernetes.io/name=traefik -f \
+  | jq 'select(.RouterName != null) | {host: .RequestHost, path: .RequestPath, status: .DownstreamStatus, router: .RouterName}'
+
+# Port-forward para o dashboard local
+kubectl port-forward -n traefik svc/traefik 9000:9000
+# Acesse: http://localhost:9000/dashboard/
+```
+
+---
+
+## Comparativo: Traefik vs NGINX Ingress
+
+| Característica              | Traefik                              | NGINX Ingress                         |
+|-----------------------------|--------------------------------------|---------------------------------------|
+| Descoberta dinâmica         | Sim — sem reload                     | Reload ao mudar configuração          |
+| CRDs avançados              | `IngressRoute`, `Middleware`, etc.   | Apenas via anotações                  |
+| TLS automático (ACME)       | Nativo                               | Requer cert-manager externo           |
+| Canary / Traffic splitting  | Nativo via `weight`                  | Requer NGINX Plus ou anotações        |
+| Dashboard                   | Nativo                               | Não incluso                           |
+| Middleware encadeado        | Nativo com `Chain`                   | Via snippets de configuração          |
+| Maturidade / adoção         | Alta (cloud-native)                  | Muito alta (mais comum)               |
+| Melhor para                 | Ambientes dinâmicos, microserviços   | Workloads tradicionais, mais suporte  |

@@ -1,0 +1,619 @@
+---
+title: "Expondo IPs Externos (MetalLB)"
+description: "Como expor serviços Kubernetes para redes externas em clusters bare-metal e on-premise usando MetalLB, kube-vip e BGP"
+---
+
+# Expondo IPs Externos em Clusters Bare-Metal
+
+Em provedores de cloud (AWS, GCP, Azure), ao criar um Service do tipo `LoadBalancer`, o provedor provisiona automaticamente um IP externo. Em ambientes **bare-metal** e **on-premise**, isso não existe — o campo `EXTERNAL-IP` fica eternamente em `<pending>`.
+
+O **MetalLB** resolve esse problema: ele implementa um controlador de LoadBalancer para clusters sem provedor de cloud, alocando IPs de uma faixa configurada e anunciando-os na rede física.
+
+```
+Sem MetalLB (bare-metal):
+kubectl get svc minha-app
+# NAME        TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)
+# minha-app   LoadBalancer   10.96.10.25    <pending>     80:30080/TCP
+
+Com MetalLB:
+# NAME        TYPE           CLUSTER-IP     EXTERNAL-IP     PORT(S)
+# minha-app   LoadBalancer   10.96.10.25    192.168.10.50   80:30080/TCP
+```
+
+---
+
+## Como o MetalLB funciona
+
+O MetalLB opera em dois modos que diferem em como o IP é anunciado para a rede:
+
+<CardGroup cols={2}>
+  <Card title="Layer 2 (ARP/NDP)" icon="network-wired">
+    Um nó do cluster responde a requisições ARP pelo IP alocado. Simples, sem necessidade de roteador configurável. Tráfego vai para um único nó (sem balanceamento real de entrada).
+  </Card>
+  <Card title="BGP" icon="route">
+    O MetalLB estabelece sessões BGP com os roteadores da rede e anuncia os IPs via prefixos. Balanceamento ECMP real entre múltiplos nós. Requer roteador com suporte a BGP.
+  </Card>
+</CardGroup>
+
+---
+
+## Pré-requisitos de Rede Física
+
+Antes de instalar o MetalLB, mapeie sua infraestrutura:
+
+### Identificar a faixa de IPs disponível
+
+Você precisará reservar um bloco de IPs no seu range de rede que **não esteja no pool DHCP** e que seja roteável pelos clientes que vão acessar os serviços:
+
+```
+Exemplo de rede corporativa:
+  Rede principal:      192.168.10.0/24
+  Gateway:             192.168.10.1
+  Servidores (DHCP):   192.168.10.100 – 192.168.10.199
+  Nós Kubernetes:      192.168.10.50  – 192.168.10.59   (fixo, fora do DHCP)
+  Pool MetalLB:        192.168.10.200 – 192.168.10.220  (reservado — NUNCA no DHCP)
+```
+
+<Warning>
+  Os IPs do pool MetalLB **nunca** devem estar no range do DHCP do seu switch/roteador. Conflitos de IP causam instabilidade severa na rede. Reserve o range no servidor DHCP como "excluded" antes de configurar o MetalLB.
+</Warning>
+
+### Verificar kube-proxy mode
+
+O MetalLB requer que o `kube-proxy` esteja em modo `ipvs` **ou** que o `strictARP` esteja habilitado no modo `iptables`:
+
+```bash
+# Verificar modo atual do kube-proxy
+kubectl get configmap kube-proxy -n kube-system -o yaml | grep mode
+
+# Habilitar strictARP (necessário para Layer 2)
+kubectl get configmap kube-proxy -n kube-system -o yaml \
+  | sed -e "s/strictARP: false/strictARP: true/" \
+  | kubectl apply -f -
+```
+
+---
+
+## Instalação do MetalLB
+
+```bash
+helm repo add metallb https://metallb.github.io/metallb
+helm repo update
+
+helm install metallb metallb/metallb \
+  --namespace metallb-system \
+  --create-namespace \
+  --set speaker.tolerateMaster=true
+
+# Aguardar os pods ficarem prontos
+kubectl wait pod \
+  --namespace metallb-system \
+  --for=condition=ready \
+  --selector=app.kubernetes.io/name=metallb \
+  --timeout=120s
+
+kubectl get pods -n metallb-system
+# metallb-controller-xxx   Running   ← controla alocação de IPs
+# metallb-speaker-xxx      Running   ← anuncia IPs na rede (um por nó)
+```
+
+---
+
+## Modo Layer 2 (Recomendado para início)
+
+### Quando usar Layer 2
+
+- Redes simples sem suporte a BGP no switch/roteador
+- Ambientes de laboratório, homelab ou escritório
+- Quando todos os nós e clientes estão no **mesmo segmento de rede (mesmo broadcast domain)**
+
+### Limitação do Layer 2
+
+```
+Todos os pacotes externos chegam ao mesmo nó (o "speaker ativo").
+O kube-proxy distribui internamente para outros Pods, mas a
+entrada ainda é um gargalo de único nó.
+
+                                  ┌─ Pod (nó 1) ← kube-proxy
+Cliente → IP 192.168.10.200 → Nó 1 (speaker)
+                                  ├─ Pod (nó 2) ← kube-proxy
+                                  └─ Pod (nó 3) ← kube-proxy
+```
+
+Se o nó speaker falhar, o MetalLB elege outro nó e anuncia o ARP gratuitamente — failover em ~10 segundos.
+
+### Configuração Layer 2
+
+```yaml
+# metallb-l2-config.yaml
+
+# 1. Pool de IPs disponíveis para alocação
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: pool-producao
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.10.200-192.168.10.220   # Faixa principal de produção
+  autoAssign: true                    # Aloca automaticamente ao criar Services
+---
+# Pool separado para serviços específicos (ex: Ingress Controller)
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: pool-ingress
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.10.230/32               # IP fixo dedicado ao Ingress
+  autoAssign: false                   # Somente via anotação explícita
+
+---
+# 2. Anunciar os IPs via Layer 2 (ARP/NDP)
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2-advertisement
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - pool-producao
+    - pool-ingress
+  # Restringir quais nós podem ser o speaker (opcional)
+  nodeSelectors:
+    - matchLabels:
+        node-role: ingress     # Apenas nós com este label anunciam
+  # Restringir em quais interfaces de rede anunciar (opcional)
+  interfaces:
+    - eth0                     # Nome da NIC na máquina física
+```
+
+```bash
+kubectl apply -f metallb-l2-config.yaml
+
+# Verificar pools criados
+kubectl get ipaddresspool -n metallb-system
+kubectl get l2advertisement -n metallb-system
+```
+
+---
+
+## Modo BGP (Produção com roteadores gerenciáveis)
+
+### Quando usar BGP
+
+- Redes corporativas com switches L3 gerenciáveis (Cisco, Juniper, Arista, MikroTik, etc.)
+- Necessidade de **balanceamento real de entrada** entre múltiplos nós (ECMP)
+- Múltiplos VLANs ou sub-redes que precisam rotear para os serviços
+- Alta disponibilidade sem failover ARP (convergência mais rápida)
+
+### Como funciona o BGP com MetalLB
+
+```
+   Roteador físico (AS 65000)
+   ┌─────────────────────────┐
+   │  BGP peer: 192.168.10.1 │
+   └────────┬────────────────┘
+            │ sessões BGP
+     ┌──────┴──────┐
+     │             │
+  Nó 1          Nó 2          ← speakers anunciam prefixos
+  (AS 64512)   (AS 64512)
+     │             │
+  [Pods]        [Pods]
+
+ECMP: roteador balanceia entre nó 1 e nó 2 nativamente
+```
+
+### Configuração BGP
+
+```yaml
+# metallb-bgp-config.yaml
+
+# 1. Pool de IPs
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: pool-bgp-producao
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.10.100.0/24           # Sub-rede inteira anunciada via BGP
+  autoAssign: true
+
+---
+# 2. Configuração do peer BGP (roteador físico)
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: roteador-core
+  namespace: metallb-system
+spec:
+  myASN: 64512                 # ASN privado do cluster (64512–65534)
+  peerASN: 65000               # ASN do roteador físico
+  peerAddress: 192.168.10.1    # IP do roteador (interface voltada para os nós)
+  peerPort: 179
+  holdTime: 90s
+  keepaliveTime: 30s
+  # Autenticação MD5 (configurar no roteador também)
+  password: "bgp-senha-compartilhada"
+  # Restringir quais nós estabelecem sessão BGP
+  nodeSelectors:
+    - matchLabels:
+        kubernetes.io/role: worker
+
+---
+# Peer BGP secundário (roteador de redundância)
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: roteador-core-secundario
+  namespace: metallb-system
+spec:
+  myASN: 64512
+  peerASN: 65000
+  peerAddress: 192.168.10.2    # IP do roteador secundário (HSRP/VRRP standby)
+  password: "bgp-senha-compartilhada"
+
+---
+# 3. Anunciar via BGP
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: bgp-advertisement
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - pool-bgp-producao
+  # Comunidades BGP (para políticas no roteador)
+  communities:
+    - 65000:100                # Tag personalizada para filtragem no roteador
+  # Aggregation: anuncia a rede inteira ao invés de /32 por IP
+  aggregationLength: 24        # Agrega /32 individuais em um /24
+  localPref: 100               # BGP local preference
+```
+
+### Configuração no roteador (exemplo MikroTik RouterOS)
+
+```bash
+# No roteador MikroTik:
+/routing bgp peer
+add name=k8s-node1 remote-address=192.168.10.51 remote-as=64512 \
+    ttl=default password="bgp-senha-compartilhada"
+add name=k8s-node2 remote-address=192.168.10.52 remote-as=64512 \
+    ttl=default password="bgp-senha-compartilhada"
+add name=k8s-node3 remote-address=192.168.10.53 remote-as=64512 \
+    ttl=default password="bgp-senha-compartilhada"
+
+# Verificar sessões estabelecidas
+/routing bgp peer print
+
+# Ver prefixos recebidos do cluster
+/ip route print where received-from~"k8s"
+```
+
+### Configuração no roteador (exemplo Cisco IOS)
+
+```
+router bgp 65000
+  neighbor 192.168.10.51 remote-as 64512
+  neighbor 192.168.10.51 password bgp-senha-compartilhada
+  neighbor 192.168.10.52 remote-as 64512
+  neighbor 192.168.10.52 password bgp-senha-compartilhada
+  neighbor 192.168.10.53 remote-as 64512
+  neighbor 192.168.10.53 password bgp-senha-compartilhada
+  !
+  address-family ipv4
+    neighbor 192.168.10.51 activate
+    neighbor 192.168.10.51 route-map K8S-IN in
+    neighbor 192.168.10.52 activate
+    neighbor 192.168.10.53 activate
+  exit-address-family
+!
+! Aceitar apenas os prefixos do pool do cluster
+ip prefix-list K8S-PREFIXES seq 10 permit 10.10.100.0/24 le 32
+route-map K8S-IN permit 10
+  match ip address prefix-list K8S-PREFIXES
+```
+
+---
+
+## Múltiplos Pools por VLAN / Segmento
+
+Em ambientes com múltiplas VLANs, configure um pool por segmento:
+
+```yaml
+# metallb-multi-vlan.yaml
+---
+# VLAN 10 — Produção
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: pool-vlan10-producao
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.10.10.100-10.10.10.150
+  autoAssign: false             # Controlado por anotação
+
+---
+# VLAN 20 — Staging
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: pool-vlan20-staging
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.10.20.100-10.10.20.120
+  autoAssign: false
+
+---
+# VLAN 30 — Monitoramento
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: pool-vlan30-monitor
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.10.30.10-10.10.30.20
+
+---
+# Layer 2: anunciar cada pool na interface correta (NIC tagged com VLAN)
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2-vlan10
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - pool-vlan10-producao
+  interfaces:
+    - eth0.10                  # Interface com tag VLAN 10
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: l2-vlan20
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - pool-vlan20-staging
+  interfaces:
+    - eth0.20                  # Interface com tag VLAN 20
+```
+
+---
+
+## Usando o IP Externo nos Services
+
+### Alocação automática (pool com `autoAssign: true`)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minha-app-lb
+  namespace: producao
+spec:
+  type: LoadBalancer
+  selector:
+    app: minha-app
+  ports:
+    - port: 80
+      targetPort: 3000
+# O MetalLB aloca automaticamente um IP do pool com autoAssign: true
+```
+
+### Selecionar um pool específico
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minha-app-lb
+  namespace: producao
+  annotations:
+    metallb.universe.tf/address-pool: pool-vlan10-producao   # Pool específico
+spec:
+  type: LoadBalancer
+  selector:
+    app: minha-app
+  ports:
+    - port: 80
+      targetPort: 3000
+```
+
+### Solicitar um IP fixo específico
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-lb
+  namespace: ingress-nginx
+  annotations:
+    metallb.universe.tf/address-pool: pool-ingress
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.10.230    # IP fixo (deve estar no pool correspondente)
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: https
+      port: 443
+      targetPort: https
+```
+
+### Compartilhar um IP entre múltiplos Services (IP sharing)
+
+Útil para expor HTTP e HTTPS no mesmo IP com Services separados:
+
+```yaml
+# Service HTTP
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-http
+  namespace: ingress-nginx
+  annotations:
+    metallb.universe.tf/address-pool: pool-ingress
+    metallb.universe.tf/allow-shared-ip: "ingress-shared"   # Chave de compartilhamento
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.10.230
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Service HTTPS (mesmo IP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-https
+  namespace: ingress-nginx
+  annotations:
+    metallb.universe.tf/address-pool: pool-ingress
+    metallb.universe.tf/allow-shared-ip: "ingress-shared"   # Mesma chave
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.10.230   # Mesmo IP — MetalLB diferencia por porta
+  ports:
+    - port: 443
+      targetPort: 443
+```
+
+---
+
+## Alternativa: kube-vip
+
+O **kube-vip** é uma alternativa ao MetalLB que funciona especialmente bem para clusters **K3s** e para expor também o endereço do **API server** com alta disponibilidade.
+
+### Quando usar kube-vip ao invés do MetalLB
+
+| Critério                              | MetalLB     | kube-vip    |
+|---------------------------------------|:-----------:|:-----------:|
+| LoadBalancer Services (workloads)     | Excelente   | Bom         |
+| VIP do Control Plane (API server HA)  | Não         | Sim         |
+| BGP avançado                          | Sim         | Limitado    |
+| K3s / RKE2 nativo                     | Compatível  | Preferido   |
+| Dependência de CRDs externos          | Sim         | Não         |
+
+### Instalação do kube-vip (Layer 2)
+
+```bash
+# Definir variáveis
+export VIP=192.168.10.100           # IP virtual do cluster
+export INTERFACE=eth0               # Interface de rede dos nós
+export KVVERSION=v0.7.1
+
+# Gerar o manifesto do DaemonSet
+docker run --network host --rm ghcr.io/kube-vip/kube-vip:$KVVERSION \
+  manifest daemonset \
+  --interface $INTERFACE \
+  --address $VIP \
+  --inCluster \
+  --taint \
+  --controlplane \
+  --services \
+  --arp \
+  --leaderElection | kubectl apply -f -
+```
+
+### ConfigMap do kube-vip para pools de IP de Services
+
+```yaml
+# kube-vip-ipam-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubevip
+  namespace: kube-system
+data:
+  range-global: "192.168.10.200-192.168.10.220"    # Pool global para Services
+  range-producao: "192.168.10.230-192.168.10.240"  # Pool por namespace
+  cidr-monitoramento: "10.10.30.0/28"              # Pool por CIDR
+```
+
+---
+
+## Fluxo de Tráfego Completo (Produção)
+
+```
+Internet / Rede Corporativa
+         │
+         ▼
+   Firewall / Roteador
+   192.168.10.1 (AS 65000)
+         │ BGP anuncia 192.168.10.200/32
+         ▼
+   IP: 192.168.10.200  ← MetalLB aloca e anuncia via BGP/ARP
+         │
+         ▼
+   Service: ingress-nginx-lb (LoadBalancer)
+         │
+         ▼
+   Ingress Controller (NGINX / Traefik)
+         │
+         ├── Host: app.empresa.com.br   → Service: frontend  → Pods
+         ├── Host: api.empresa.com.br   → Service: api       → Pods
+         └── Host: admin.empresa.com.br → Service: admin     → Pods
+```
+
+---
+
+## Verificação e Debugging
+
+```bash
+# Ver IPs alocados
+kubectl get services -A | grep LoadBalancer
+
+# Verificar alocações do MetalLB
+kubectl get ipaddresspool -n metallb-system
+kubectl get l2advertisement -n metallb-system
+kubectl get bgppeer -n metallb-system
+kubectl get bgpadvertisement -n metallb-system
+
+# Ver logs do controller (alocação de IPs)
+kubectl logs -n metallb-system \
+  -l app.kubernetes.io/component=controller --tail=50
+
+# Ver logs do speaker (anúncios ARP/BGP)
+kubectl logs -n metallb-system \
+  -l app.kubernetes.io/component=speaker --tail=50
+
+# Verificar sessões BGP (se usando BGP)
+kubectl exec -n metallb-system \
+  $(kubectl get pod -n metallb-system -l app.kubernetes.io/component=speaker \
+    -o jsonpath='{.items[0].metadata.name}') \
+  -- metallb-bgp-session-status
+
+# Testar ARP na rede (Layer 2)
+# Em qualquer máquina da mesma rede:
+arping -I eth0 192.168.10.200
+# Deve responder com o MAC do nó speaker ativo
+
+# Ver qual nó é o speaker ativo para um IP (Layer 2)
+kubectl get events -n metallb-system | grep "announcing"
+```
+
+### IP em `<pending>` após aplicar o Service
+
+```bash
+# 1. Verificar se o pool tem IPs disponíveis
+kubectl describe ipaddresspool pool-producao -n metallb-system
+
+# 2. Verificar se o namespace é permitido no pool
+kubectl get ipaddresspool pool-producao -n metallb-system -o yaml | grep namespaces
+
+# 3. Ver eventos do MetalLB
+kubectl get events -n metallb-system --sort-by='.lastTimestamp'
+
+# 4. Ver eventos do Service
+kubectl describe svc minha-app-lb -n producao | grep -A 10 Events
+```
