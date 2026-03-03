@@ -1,0 +1,436 @@
+---
+title: "Pods"
+description: "A menor unidade de execução do Kubernetes — conceitos, ciclo de vida e boas práticas"
+---
+
+# Pods
+
+Um **Pod** é a menor e mais básica unidade de deployment no Kubernetes. Ele encapsula um ou mais containers que compartilham:
+
+- O mesmo endereço IP e porta de rede
+- O mesmo volume de armazenamento
+- O mesmo ciclo de vida
+
+Na prática, a maioria dos Pods contém **um único container**. Multi-container Pods são usados em padrões específicos como sidecar, ambassador e init containers.
+
+<Note>
+  Em produção, raramente você cria Pods diretamente. Use abstrações como `Deployment`, `StatefulSet` ou `DaemonSet`, que gerenciam Pods automaticamente com restart, escalonamento e rolling updates.
+</Note>
+
+## Anatomia de um Pod
+
+```yaml
+# pod-exemplo.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minha-app
+  namespace: producao
+  labels:
+    app: minha-app
+    version: "1.0.0"
+    tier: backend
+  annotations:
+    description: "Servidor de API principal"
+spec:
+  # ── Agendamento ─────────────────────────────────────────────────
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    node-type: application
+
+  # ── Segurança do Pod ────────────────────────────────────────────
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 2000
+    seccompProfile:
+      type: RuntimeDefault
+
+  # ── Credenciais do Registry ─────────────────────────────────────
+  imagePullSecrets:
+    - name: gitlab-registry-secret
+
+  # ── Containers ──────────────────────────────────────────────────
+  containers:
+    - name: api
+      image: registry.gitlab.com/empresa/minha-app:1.0.0
+      imagePullPolicy: Always      # Always | IfNotPresent | Never
+
+      ports:
+        - name: http
+          containerPort: 3000
+          protocol: TCP
+
+      # Variáveis de ambiente
+      env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: host
+        - name: APP_VERSION
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['version']
+
+      # Limites de recursos (OBRIGATÓRIO em produção)
+      resources:
+        requests:
+          cpu: "250m"       # 0.25 vCPU garantido
+          memory: "256Mi"   # 256MB garantido
+        limits:
+          cpu: "500m"       # Máximo 0.5 vCPU
+          memory: "512Mi"   # Máximo 512MB
+
+      # Segurança do container
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+      # Volumes montados
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+
+      # ── Health Checks ────────────────────────────────────────
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 3000
+        failureThreshold: 30
+        periodSeconds: 5        # Até 150s para a aplicação iniciar
+
+      livenessProbe:
+        httpGet:
+          path: /health/live
+          port: 3000
+        initialDelaySeconds: 10
+        periodSeconds: 15
+        failureThreshold: 3
+        timeoutSeconds: 3
+
+      readinessProbe:
+        httpGet:
+          path: /health/ready
+          port: 3000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        failureThreshold: 3
+        successThreshold: 1
+
+  # ── Volumes ─────────────────────────────────────────────────────
+  volumes:
+    - name: tmp
+      emptyDir: {}
+    - name: config
+      configMapRef:
+        name: app-config
+
+  # ── Política de Restart ─────────────────────────────────────────
+  restartPolicy: Always       # Always | OnFailure | Never
+
+  # ── Encerramento Gracioso ────────────────────────────────────────
+  terminationGracePeriodSeconds: 30
+```
+
+## Ciclo de Vida do Pod
+
+```
+Pending ──► Running ──► Succeeded
+                └──────► Failed
+                └──────► Unknown
+```
+
+| Fase        | Descrição                                                               |
+|-------------|-------------------------------------------------------------------------|
+| `Pending`   | Pod aceito, aguardando agendamento ou download de imagem                 |
+| `Running`   | Pod agendado em um nó, com ao menos um container em execução             |
+| `Succeeded` | Todos os containers terminaram com sucesso (exit code 0)                 |
+| `Failed`    | Ao menos um container terminou com erro                                  |
+| `Unknown`   | Estado não pôde ser determinado (geralmente problema de rede com o nó)  |
+
+### Estados dos Containers
+
+```bash
+kubectl get pod minha-app -n producao -o wide
+
+# Ver detalhes de estado e eventos
+kubectl describe pod minha-app -n producao
+```
+
+| Estado       | Descrição                                          |
+|--------------|----------------------------------------------------|
+| `Waiting`    | Container aguardando (download de imagem, etc.)    |
+| `Running`    | Container em execução                              |
+| `Terminated` | Container encerrou (com sucesso ou erro)           |
+
+## Health Checks
+
+Os probes garantem que o Kubernetes saiba quando um container está saudável e pronto para receber tráfego.
+
+### Tipos de Probe
+
+<AccordionGroup>
+  <Accordion title="startupProbe — Inicialização">
+    Verifica se a aplicação **iniciou corretamente**. Desativa os outros probes até que este passe. Ideal para aplicações lentas para subir.
+
+    ```yaml
+    startupProbe:
+      httpGet:
+        path: /health
+        port: 3000
+      failureThreshold: 30   # 30 tentativas
+      periodSeconds: 5       # a cada 5s = até 150s total
+    ```
+  </Accordion>
+
+  <Accordion title="livenessProbe — Vitalidade">
+    Verifica se o container está **vivo**. Se falhar, o container é **reiniciado**. Use para detectar deadlocks ou travamentos.
+
+    ```yaml
+    livenessProbe:
+      httpGet:
+        path: /health/live
+        port: 3000
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      failureThreshold: 3
+    ```
+  </Accordion>
+
+  <Accordion title="readinessProbe — Prontidão">
+    Verifica se o container está **pronto para receber tráfego**. Se falhar, o Pod é removido dos endpoints do Service — sem reinício. Ideal para verificar dependências externas (DB, cache).
+
+    ```yaml
+    readinessProbe:
+      httpGet:
+        path: /health/ready
+        port: 3000
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Métodos de Probe
+
+```yaml
+# HTTP GET — mais comum para aplicações web
+httpGet:
+  path: /health
+  port: 3000
+  httpHeaders:
+    - name: X-Health-Check
+      value: "true"
+
+# TCP Socket — para serviços sem HTTP (bancos, Redis)
+tcpSocket:
+  port: 5432
+
+# Exec — executa um comando dentro do container
+exec:
+  command:
+    - /bin/sh
+    - -c
+    - "pg_isready -U postgres"
+```
+
+## Init Containers
+
+Init containers são executados **antes** dos containers principais, em sequência. São usados para:
+- Aguardar dependências ficarem prontas
+- Executar migrations de banco de dados
+- Pré-popular arquivos de configuração
+
+```yaml
+spec:
+  initContainers:
+    - name: aguardar-banco
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          until nc -z postgres-service 5432; do
+            echo "Aguardando PostgreSQL..."
+            sleep 3
+          done
+          echo "PostgreSQL disponível!"
+
+    - name: executar-migration
+      image: registry.gitlab.com/empresa/minha-app:1.0.0
+      command: ["node", "dist/migrate.js"]
+      env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: url
+
+  containers:
+    - name: api
+      image: registry.gitlab.com/empresa/minha-app:1.0.0
+      # ... container principal só inicia após os initContainers
+```
+
+## Sidecar Container
+
+Container auxiliar que roda junto com o principal no mesmo Pod, compartilhando rede e volumes:
+
+```yaml
+spec:
+  containers:
+    - name: api
+      image: registry.gitlab.com/empresa/minha-app:1.0.0
+      volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+
+    - name: log-shipper          # Sidecar que coleta logs
+      image: fluent/fluent-bit:3.0
+      volumeMounts:
+        - name: logs
+          mountPath: /logs
+          readOnly: true
+      env:
+        - name: LOKI_URL
+          value: "http://loki.monitoramento:3100"
+
+  volumes:
+    - name: logs
+      emptyDir: {}
+```
+
+## Encerramento Gracioso (Graceful Shutdown)
+
+O Kubernetes envia `SIGTERM` antes de encerrar o Pod. A aplicação deve capturar e finalizar conexões abertas:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 30   # Padrão: 30s
+  containers:
+    - name: api
+      lifecycle:
+        preStop:
+          exec:
+            command: ["/bin/sh", "-c", "sleep 5"]   # Aguarda o LB remover o Pod dos endpoints
+```
+
+```javascript
+// Node.js — captura SIGTERM
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM recebido, encerrando...')
+  await server.close()         // Para de aceitar novas conexões
+  await db.disconnect()        // Fecha conexões com o banco
+  process.exit(0)
+})
+```
+
+## Debugging de Pods
+
+```bash
+# Ver logs do container principal
+kubectl logs minha-app -n producao
+
+# Logs em tempo real (follow)
+kubectl logs -f minha-app -n producao
+
+# Logs de um container específico (multi-container Pod)
+kubectl logs minha-app -c log-shipper -n producao
+
+# Logs das últimas N linhas
+kubectl logs minha-app --tail=100 -n producao
+
+# Abrir shell no container
+kubectl exec -it minha-app -n producao -- /bin/sh
+
+# Copiar arquivo do container para local
+kubectl cp producao/minha-app:/app/logs/error.log ./error.log
+
+# Ver eventos do Pod (falhas de scheduling, erros de imagem, etc.)
+kubectl describe pod minha-app -n producao | grep -A 20 Events
+
+# Ver uso de recursos em tempo real
+kubectl top pod minha-app -n producao
+```
+
+## Políticas de Agendamento
+
+### nodeSelector — Selecionar nó por label
+
+```yaml
+spec:
+  nodeSelector:
+    node-type: high-memory
+    kubernetes.io/os: linux
+```
+
+### Taints e Tolerations
+
+Permite que Pods tolerem nós com restrições (ex: nós dedicados a GPU):
+
+```yaml
+spec:
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "gpu"
+      effect: "NoSchedule"
+```
+
+### Affinity — Regras de co-localização
+
+```yaml
+spec:
+  affinity:
+    # Prefere nós com label "zone=us-east-1a"
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: zone
+                operator: In
+                values: ["us-east-1a"]
+
+    # Distribui réplicas em nós diferentes
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["minha-app"]
+          topologyKey: kubernetes.io/hostname
+```
+
+## Comandos de Referência
+
+```bash
+# Listar Pods com IP e nó
+kubectl get pods -n producao -o wide
+
+# Ver Pods com status detalhado
+kubectl get pods -n producao -o json | jq '.items[].status.phase'
+
+# Deletar Pod (será recriado pelo Deployment)
+kubectl delete pod minha-app -n producao
+
+# Deletar Pods com CrashLoopBackOff
+kubectl delete pods -n producao --field-selector=status.phase=Failed
+
+# Forçar deleção de Pod preso em Terminating
+kubectl delete pod minha-app -n producao --grace-period=0 --force
+```

@@ -1,0 +1,226 @@
+---
+title: "Namespace"
+description: "Isolamento lógico de recursos dentro de um cluster Kubernetes"
+---
+
+# Namespace
+
+Um **Namespace** é a unidade de isolamento lógico dentro do Kubernetes. Ele permite dividir um único cluster em múltiplos ambientes virtuais — produção, staging, equipes diferentes — compartilhando a mesma infraestrutura física.
+
+## Namespaces Padrão do Cluster
+
+```bash
+kubectl get namespaces
+```
+
+| Namespace          | Finalidade                                                        |
+|--------------------|-------------------------------------------------------------------|
+| `default`          | Namespace padrão quando nenhum é especificado                     |
+| `kube-system`      | Componentes internos do Kubernetes (CoreDNS, kube-proxy, etc.)   |
+| `kube-public`      | Recursos legíveis por todos os usuários, sem autenticação         |
+| `kube-node-lease`  | Heartbeats de disponibilidade dos nós                             |
+
+<Warning>
+  Nunca implante aplicações nos namespaces `kube-system` ou `kube-public`. Reserve-os para uso exclusivo do cluster.
+</Warning>
+
+## Criar um Namespace
+
+### Via manifesto YAML (recomendado)
+
+```yaml
+# namespace-producao.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: producao
+  labels:
+    env: producao
+    equipe: backend
+    app.kubernetes.io/managed-by: kubectl
+```
+
+```bash
+kubectl apply -f namespace-producao.yaml
+```
+
+### Via CLI
+
+```bash
+kubectl create namespace producao
+kubectl create namespace staging
+kubectl create namespace monitoramento
+```
+
+## Estrutura Recomendada de Namespaces
+
+```
+cluster-producao/
+├── producao          # Aplicações em produção
+├── staging           # Homologação / pré-prod
+├── dev               # Ambiente de desenvolvimento
+├── monitoramento     # Prometheus, Grafana, Loki
+├── ingress-nginx     # Ingress Controller
+└── cert-manager      # Gerenciamento de certificados TLS
+```
+
+## Trabalhar com Namespaces
+
+### Especificar o namespace em cada comando
+
+```bash
+# Listar Pods de um namespace
+kubectl get pods --namespace=producao
+
+# Forma abreviada
+kubectl get pods -n producao
+
+# Ver todos os namespaces ao mesmo tempo
+kubectl get pods --all-namespaces
+kubectl get pods -A
+```
+
+### Definir namespace padrão no contexto
+
+Evita digitar `-n producao` em cada comando:
+
+```bash
+kubectl config set-context --current --namespace=producao
+
+# Verificar o namespace atual
+kubectl config view --minify | grep namespace
+```
+
+## ResourceQuota — Limitar Recursos por Namespace
+
+Evita que um namespace consuma todos os recursos do cluster:
+
+```yaml
+# resourcequota-producao.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: quota-producao
+  namespace: producao
+spec:
+  hard:
+    # Limites de CPU e memória
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    # Limites de objetos
+    pods: "50"
+    services: "20"
+    persistentvolumeclaims: "10"
+    secrets: "30"
+    configmaps: "30"
+```
+
+```bash
+kubectl apply -f resourcequota-producao.yaml
+kubectl describe resourcequota quota-producao -n producao
+```
+
+## LimitRange — Definir Padrões de Recursos por Container
+
+Garante que todos os containers tenham `requests` e `limits` definidos automaticamente:
+
+```yaml
+# limitrange-producao.yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: limites-padrao
+  namespace: producao
+spec:
+  limits:
+    - type: Container
+      default:              # Aplicado como limits se não especificado
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:       # Aplicado como requests se não especificado
+        cpu: "100m"
+        memory: "128Mi"
+      max:                  # Máximo permitido
+        cpu: "2"
+        memory: "2Gi"
+      min:                  # Mínimo obrigatório
+        cpu: "50m"
+        memory: "64Mi"
+    - type: PersistentVolumeClaim
+      max:
+        storage: 50Gi
+      min:
+        storage: 1Gi
+```
+
+```bash
+kubectl apply -f limitrange-producao.yaml
+kubectl describe limitrange limites-padrao -n producao
+```
+
+## NetworkPolicy — Isolamento de Rede entre Namespaces
+
+Por padrão, todos os Pods de todos os namespaces se comunicam livremente. Use `NetworkPolicy` para restringir:
+
+```yaml
+# networkpolicy-isolamento.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolar-namespace
+  namespace: producao
+spec:
+  podSelector: {}           # Aplica a todos os Pods do namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: producao   # Só permite tráfego do mesmo namespace
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx  # E do Ingress Controller
+  egress:
+    - to:
+        - namespaceSelector: {}   # Permite saída para qualquer namespace
+    - ports:
+        - port: 53                # DNS
+          protocol: UDP
+```
+
+## Deletar Namespace
+
+<Warning>
+  Deletar um namespace **apaga todos os recursos dentro dele** (Pods, Services, PVCs, etc.). Esta operação é irreversível.
+</Warning>
+
+```bash
+# Listar todos os recursos antes de deletar
+kubectl get all -n producao
+
+# Deletar o namespace e todos os seus recursos
+kubectl delete namespace producao
+```
+
+## Comandos de Referência
+
+```bash
+# Listar namespaces
+kubectl get ns
+
+# Descrever um namespace
+kubectl describe ns producao
+
+# Ver consumo de recursos por namespace
+kubectl describe resourcequota -n producao
+
+# Listar todos os recursos de um namespace
+kubectl get all -n producao
+
+# Exportar todos os manifests de um namespace
+kubectl get all -n producao -o yaml > backup-producao.yaml
+```

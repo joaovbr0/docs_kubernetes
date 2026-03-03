@@ -81,6 +81,13 @@
       ]
     },
     {
+      "group": "Kubernetes — Segurança e Acesso",
+      "pages": [
+        "kubernetes/rbac",
+        "kubernetes/rbac-oidc-keycloak"
+      ]
+    },
+    {
       "group": "Kubernetes — Segredos Externos",
       "pages": [
         "kubernetes/secrets-vault",

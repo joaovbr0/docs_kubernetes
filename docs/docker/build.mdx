@@ -1,0 +1,205 @@
+---
+title: "Build da Imagem Docker"
+description: "Como construir imagens Docker otimizadas para produção com multi-stage builds"
+---
+
+# Build da Imagem Docker
+
+O processo de build é o passo inicial do fluxo de deploy. O objetivo é gerar uma imagem enxuta, segura e reproduzível, pronta para ser executada no Kubernetes.
+
+## Estrutura do Dockerfile
+
+O padrão recomendado para produção é o **multi-stage build**. Ele separa o ambiente de compilação/build do ambiente de execução final, resultando em imagens menores e sem dependências desnecessárias.
+
+### Exemplo: Aplicação Node.js
+
+```dockerfile
+# ─── Stage 1: Build ───────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copia apenas os arquivos de dependências primeiro (melhor uso de cache)
+COPY package.json package-lock.json ./
+RUN npm ci --only=production
+
+# Copia o restante do código e executa o build
+COPY . .
+RUN npm run build
+
+# ─── Stage 2: Runtime ─────────────────────────────────────────────
+FROM node:20-alpine AS runtime
+
+# Não executar como root em produção
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+
+# Copia apenas os artefatos necessários do stage de build
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY package.json ./
+
+USER appuser
+
+EXPOSE 3000
+CMD ["node", "dist/main.js"]
+```
+
+### Exemplo: Aplicação Go
+
+```dockerfile
+# ─── Stage 1: Build ───────────────────────────────────────────────
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server ./cmd/server
+
+# ─── Stage 2: Runtime ─────────────────────────────────────────────
+FROM scratch
+
+COPY --from=builder /app/server /server
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+EXPOSE 8080
+ENTRYPOINT ["/server"]
+```
+
+<Note>
+  O uso de `FROM scratch` ou `alpine` no stage final reduz drasticamente o tamanho da imagem e a superfície de ataque em produção.
+</Note>
+
+## Arquivo `.dockerignore`
+
+Sempre utilize um `.dockerignore` para evitar copiar arquivos desnecessários para o contexto de build, acelerando o processo e evitando vazamento de arquivos sensíveis.
+
+```plaintext
+# Dependências locais
+node_modules/
+vendor/
+
+# Arquivos de ambiente e segredos
+.env
+.env.*
+*.pem
+*.key
+
+# Artefatos de build local
+dist/
+build/
+out/
+
+# Controle de versão
+.git/
+.gitignore
+
+# Arquivos de editor e OS
+.DS_Store
+.vscode/
+*.log
+
+# Docker
+Dockerfile*
+docker-compose*
+```
+
+## Executando o Build
+
+### Build básico
+
+```bash
+docker build -t minha-app:1.0.0 .
+```
+
+### Build com argumentos (build args)
+
+Use `ARG` no Dockerfile para parametrizar valores em tempo de build:
+
+```bash
+docker build \
+  --build-arg NODE_ENV=production \
+  --build-arg APP_VERSION=1.0.0 \
+  -t minha-app:1.0.0 \
+  .
+```
+
+```dockerfile
+ARG NODE_ENV=development
+ARG APP_VERSION=local
+
+ENV NODE_ENV=$NODE_ENV
+ENV APP_VERSION=$APP_VERSION
+```
+
+### Build com plataforma específica (multi-arch)
+
+Para clusters que rodam em ARM (ex: AWS Graviton, Apple Silicon):
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t minha-app:1.0.0 \
+  --push \
+  .
+```
+
+<Warning>
+  Em pipelines CI/CD, sempre especifique a plataforma de destino (`--platform linux/amd64`) para evitar incompatibilidade com os nós do cluster Kubernetes.
+</Warning>
+
+## Convenção de Tags
+
+Utilize uma convenção de tags consistente para facilitar rastreabilidade e rollback:
+
+| Padrão de Tag             | Quando usar                                    |
+|---------------------------|------------------------------------------------|
+| `1.0.0`                   | Versão semântica para releases estáveis        |
+| `1.0.0-rc.1`              | Release candidate para testes                  |
+| `main-abc1234`            | Branch + hash do commit (útil em CI/CD)        |
+| `latest`                  | Última versão estável (evitar em produção)      |
+
+```bash
+# Boas práticas de tagging
+IMAGE_TAG=$(git rev-parse --short HEAD)
+APP_VERSION="1.0.0"
+
+docker build -t minha-app:${APP_VERSION} .
+docker tag minha-app:${APP_VERSION} minha-app:main-${IMAGE_TAG}
+```
+
+<Tip>
+  Evite usar apenas `latest` em produção. Tags imutáveis como a versão semântica ou o hash do commit garantem reprodutibilidade e facilitam rollbacks.
+</Tip>
+
+## Verificando a Imagem
+
+Após o build, inspecione a imagem antes de enviá-la:
+
+```bash
+# Ver detalhes e tamanho
+docker image inspect minha-app:1.0.0
+
+# Listar camadas e tamanhos
+docker history minha-app:1.0.0
+
+# Testar localmente antes do push
+docker run --rm -p 3000:3000 minha-app:1.0.0
+```
+
+## Próximos Passos
+
+Com a imagem construída, o próximo passo é enviá-la para um registry:
+
+<CardGroup cols={2}>
+  <Card title="Push para GitLab Registry" icon="gitlab" href="/docker/push-gitlab">
+    Envie a imagem para o GitLab Container Registry integrado ao seu projeto.
+  </Card>
+  <Card title="Push para Registry Local" icon="database" href="/docker/push-local-registry">
+    Use um registry self-hosted para ambientes isolados ou on-premise.
+  </Card>
+</CardGroup>

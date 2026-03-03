@@ -1,0 +1,521 @@
+---
+title: "RBAC"
+description: "Role-Based Access Control no Kubernetes — controle granular de permissões para usuários, grupos e ServiceAccounts"
+---
+
+# RBAC — Role-Based Access Control
+
+O **RBAC** é o sistema de autorização do Kubernetes. Ele controla **quem** pode fazer **o quê** em **quais recursos**. Toda requisição ao API server passa pelo RBAC antes de ser executada.
+
+```
+Requisição ao API server
+         │
+         ▼
+   Autenticação          ← quem é você? (certificado, token, OIDC...)
+         │
+         ▼
+   Autorização (RBAC)    ← você tem permissão para isso?
+         │
+         ▼
+   Admission Controllers ← a requisição é válida?
+         │
+         ▼
+   Execução
+```
+
+## Os 4 Recursos do RBAC
+
+<CardGroup cols={2}>
+  <Card title="Role" icon="id-card">
+    Define permissões **dentro de um namespace**. Não tem efeito fora dele.
+  </Card>
+  <Card title="ClusterRole" icon="globe">
+    Define permissões **em todo o cluster** ou em recursos não-namespacedos (Nodes, PVs, Namespaces).
+  </Card>
+  <Card title="RoleBinding" icon="link">
+    Liga uma **Role ou ClusterRole** a um sujeito (usuário, grupo, ServiceAccount) **dentro de um namespace**.
+  </Card>
+  <Card title="ClusterRoleBinding" icon="link">
+    Liga uma **ClusterRole** a um sujeito com escopo **global no cluster**.
+  </Card>
+</CardGroup>
+
+### Quando usar cada combinação
+
+| Binding            | Role          | Escopo do acesso                                  |
+|--------------------|---------------|---------------------------------------------------|
+| `RoleBinding`      | `Role`        | Namespace específico                              |
+| `RoleBinding`      | `ClusterRole` | Namespace específico (reutiliza a ClusterRole)    |
+| `ClusterRoleBinding` | `ClusterRole` | Cluster inteiro                                 |
+
+<Note>
+  `RoleBinding` + `ClusterRole` é um padrão muito útil: você define a ClusterRole uma vez e a aplica em namespaces diferentes com RoleBindings distintos.
+</Note>
+
+---
+
+## Sujeitos (Subjects)
+
+Os sujeitos são as identidades que recebem permissões:
+
+| Tipo             | Exemplo                              | Descrição                             |
+|------------------|--------------------------------------|---------------------------------------|
+| `User`           | `joao@empresa.com`                   | Usuário humano (gerenciado externamente) |
+| `Group`          | `team-backend`                       | Grupo de usuários                     |
+| `ServiceAccount` | `minha-app-sa` no namespace `prod`   | Identidade de um Pod/workload         |
+
+---
+
+## Verbos e Recursos
+
+### Verbos disponíveis
+
+| Verbo      | Operação HTTP equivalente | O que faz                              |
+|------------|--------------------------|----------------------------------------|
+| `get`      | GET                      | Lê um recurso específico               |
+| `list`     | GET (coleção)            | Lista recursos                         |
+| `watch`    | GET + stream             | Observa mudanças em tempo real         |
+| `create`   | POST                     | Cria um novo recurso                   |
+| `update`   | PUT                      | Substitui um recurso inteiro           |
+| `patch`    | PATCH                    | Atualiza campos específicos            |
+| `delete`   | DELETE                   | Remove um recurso                      |
+| `deletecollection` | DELETE (coleção) | Remove múltiplos recursos          |
+| `exec`     | POST (subresource)       | Executa comandos em Pods               |
+| `*`        | —                        | Todos os verbos                        |
+
+### Listar todos os recursos e seus grupos de API
+
+```bash
+# Ver todos os recursos, se são namespacedos e quais verbos aceitam
+kubectl api-resources -o wide
+
+# Ver grupos de API
+kubectl api-versions
+```
+
+---
+
+## Role — Permissões por Namespace
+
+### Role de leitura (desenvolvedor sem permissão de escrita)
+
+```yaml
+# role-dev-readonly.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-readonly
+  namespace: producao
+rules:
+  # Leitura de workloads
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+
+  # Leitura de Pods e logs
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status"]
+    verbs: ["get", "list", "watch"]
+
+  # Proibido: exec em Pods (sem pods/exec)
+
+  # Leitura de Services e Endpoints
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+
+  # Leitura de ConfigMaps (não de Secrets)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+  # Leitura de eventos
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+```
+
+### Role de deploy (CI/CD — permissão de escrita em Deployments)
+
+```yaml
+# role-deploy.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: producao
+rules:
+  # Gerenciar Deployments (deploy, rollback, scale)
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Gerenciar ConfigMaps (atualizar config durante deploy)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Gerenciar Secrets (sem listar — apenas atualizar os existentes)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+
+  # Ler Pods para acompanhar o rollout
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+```
+
+### Role de admin de namespace (tudo, exceto RBAC e deletar o namespace)
+
+```yaml
+# role-namespace-admin.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-admin
+  namespace: producao
+rules:
+  - apiGroups: ["", "apps", "batch", "autoscaling", "networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+
+  # Pode ler as regras RBAC do namespace, mas não modificar
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch"]
+```
+
+---
+
+## ClusterRole — Permissões no Cluster Inteiro
+
+### ClusterRole para monitoramento (Prometheus, Grafana)
+
+```yaml
+# clusterrole-monitoring.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monitoring-viewer
+rules:
+  # Métricas de todos os Pods e Nodes
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "nodes/proxy", "pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+
+  # Ingresses para service discovery
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+
+  # Acesso ao endpoint /metrics de todos os namespaces
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor", "/healthz", "/readyz"]
+    verbs: ["get"]
+```
+
+### ClusterRole para operadores de plataforma
+
+```yaml
+# clusterrole-platform-operator.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-operator
+rules:
+  # Gerenciar namespaces
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Gerenciar PVs (cluster-scoped)
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Gerenciar StorageClasses
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Gerenciar CRDs (custom resources)
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+
+  # Ler Nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+```
+
+---
+
+## RoleBinding — Associar Permissões
+
+### Usuário individual em um namespace
+
+```yaml
+# rolebinding-joao-dev.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: joao-dev-readonly
+  namespace: producao
+subjects:
+  - kind: User
+    name: joao@empresa.com      # Deve bater com o claim do token (CN ou email)
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: dev-readonly
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Grupo inteiro em um namespace
+
+```yaml
+# rolebinding-grupo-backend.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backend-team-deploy
+  namespace: producao
+subjects:
+  - kind: Group
+    name: team-backend           # Nome do grupo (do OIDC, LDAP ou certificado)
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: deployer                 # Reutiliza a ClusterRole no escopo do namespace
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### ServiceAccount de uma pipeline CI/CD
+
+```yaml
+# rolebinding-cicd-sa.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-cicd-deploy
+  namespace: producao
+subjects:
+  - kind: ServiceAccount
+    name: gitlab-runner-sa
+    namespace: gitlab             # Namespace onde a SA vive
+roleRef:
+  kind: Role
+  name: deployer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### ClusterRoleBinding — admin do cluster
+
+```yaml
+# clusterrolebinding-admin.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: plataforma-admins
+subjects:
+  - kind: Group
+    name: platform-admins        # Grupo com acesso total
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin            # ClusterRole built-in com acesso total
+  apiGroup: rbac.authorization.k8s.io
+```
+
+---
+
+## ClusterRoles Built-in
+
+O Kubernetes já inclui ClusterRoles prontas para uso:
+
+| ClusterRole          | Nível de acesso                                              |
+|----------------------|--------------------------------------------------------------|
+| `cluster-admin`      | Acesso total a tudo — equivalente ao root                    |
+| `admin`              | Acesso total dentro de um namespace (via RoleBinding)        |
+| `edit`               | Leitura e escrita de recursos (sem RBAC e sem Secrets)       |
+| `view`               | Somente leitura de recursos não sensíveis                    |
+
+```bash
+# Usar as built-in via RoleBinding (escopo de namespace)
+kubectl create rolebinding joao-editor \
+  --clusterrole=edit \
+  --user=joao@empresa.com \
+  --namespace=staging
+```
+
+---
+
+## ServiceAccount para Workloads
+
+Cada Pod roda com uma ServiceAccount que define o que ele pode fazer no cluster.
+
+### Criar SA com permissões mínimas
+
+```yaml
+# sa-minha-app.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minha-app-sa
+  namespace: producao
+  annotations:
+    description: "SA da API principal — acesso mínimo"
+automountServiceAccountToken: false   # Não monta o token automaticamente
+---
+# Permissão: apenas ler ConfigMaps do próprio namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: minha-app-role
+  namespace: producao
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["app-config"]     # Apenas este ConfigMap específico
+    verbs: ["get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: minha-app-rolebinding
+  namespace: producao
+subjects:
+  - kind: ServiceAccount
+    name: minha-app-sa
+    namespace: producao
+roleRef:
+  kind: Role
+  name: minha-app-role
+  apiGroup: rbac.authorization.k8s.io
+```
+
+```yaml
+# Referenciar no Deployment
+spec:
+  template:
+    spec:
+      serviceAccountName: minha-app-sa
+      automountServiceAccountToken: false   # Segurança: desabilitar se o app não usa a API
+```
+
+---
+
+## Auditoria e Verificação
+
+### Verificar permissões com `auth can-i`
+
+```bash
+# O que EU posso fazer?
+kubectl auth can-i --list -n producao
+
+# Um usuário específico pode criar Pods?
+kubectl auth can-i create pods \
+  --as=joao@empresa.com \
+  --namespace=producao
+
+# Um grupo pode deletar Deployments?
+kubectl auth can-i delete deployments \
+  --as-group=team-backend \
+  --as=fake-user \
+  --namespace=producao
+
+# Uma ServiceAccount pode listar Secrets?
+kubectl auth can-i list secrets \
+  --as=system:serviceaccount:producao:minha-app-sa \
+  --namespace=producao
+```
+
+### Ver regras efetivas de um sujeito
+
+```bash
+# Listar todas as Roles e ClusterRoles de um ServiceAccount
+kubectl get rolebindings,clusterrolebindings -A \
+  -o json | jq '
+    .items[] |
+    select(
+      .subjects[]? |
+      .kind == "ServiceAccount" and
+      .name == "minha-app-sa"
+    ) |
+    {binding: .metadata.name, role: .roleRef.name, namespace: .metadata.namespace}
+  '
+
+# Ver todas as permissões de um namespace específico
+kubectl get roles,rolebindings -n producao
+kubectl describe rolebinding -n producao
+```
+
+### Auditoria de acessos no API server
+
+Habilite o audit log no API server (`/etc/kubernetes/audit-policy.yaml`):
+
+```yaml
+# audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # Registrar todas as operações de escrita em Secrets
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Registrar exec em Pods (acesso interativo)
+  - level: Request
+    resources:
+      - group: ""
+        resources: ["pods/exec", "pods/portforward", "pods/attach"]
+
+  # Registrar mudanças em RBAC
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+
+  # Ignorar leituras rotineiras do kubelet
+  - level: None
+    users: ["system:node:*"]
+    verbs: ["get", "list", "watch"]
+    resources:
+      - group: ""
+        resources: ["nodes", "pods"]
+
+  # Padrão: registrar metadados
+  - level: Metadata
+```
+
+---
+
+## Boas Práticas
+
+<AccordionGroup>
+  <Accordion title="Princípio do menor privilégio">
+    Conceda apenas as permissões mínimas necessárias. Evite usar `cluster-admin` para usuários humanos — prefira Roles específicas por namespace.
+  </Accordion>
+  <Accordion title="Prefira Grupos em vez de Usuários individuais">
+    Vincular permissões a Grupos (OIDC, LDAP) em vez de usuários individuais simplifica a gestão. Ao remover alguém do grupo, o acesso é revogado automaticamente sem alterar os manifestos do Kubernetes.
+  </Accordion>
+  <Accordion title="Nunca use a ServiceAccount default">
+    A SA `default` existe em todo namespace, mas não deve ter permissões. Crie SAs específicas com `automountServiceAccountToken: false` para cada workload.
+  </Accordion>
+  <Accordion title="Reutilize ClusterRoles com RoleBindings">
+    Em vez de criar Roles idênticas em vários namespaces, crie uma `ClusterRole` e use `RoleBinding` em cada namespace. Mais fácil de manter e auditar.
+  </Accordion>
+  <Accordion title="Use resourceNames para acesso ultra-granular">
+    Restrinja o acesso a recursos específicos pelo nome, não ao tipo inteiro:
+    ```yaml
+    rules:
+      - apiGroups: [""]
+        resources: ["secrets"]
+        resourceNames: ["db-secret", "api-secret"]   # Apenas estes dois Secrets
+        verbs: ["get"]
+    ```
+  </Accordion>
+</AccordionGroup>

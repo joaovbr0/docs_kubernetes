@@ -1,0 +1,54 @@
+.callout {
+  display: flex;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  border-radius: 6px;
+  margin: 1rem 0;
+  border-left: 4px solid;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.tip {
+  background: rgba(0, 200, 83, 0.08);
+  border-color: #00c853;
+  color: var(--ifm-font-color-base);
+}
+
+[data-theme='dark'] .tip {
+  background: rgba(0, 200, 83, 0.1);
+}
+
+.note {
+  background: rgba(0, 105, 237, 0.08);
+  border-color: var(--ifm-color-primary);
+  color: var(--ifm-font-color-base);
+}
+
+[data-theme='dark'] .note {
+  background: rgba(0, 105, 237, 0.1);
+}
+
+.warning {
+  background: rgba(255, 152, 0, 0.08);
+  border-color: #ff9800;
+  color: var(--ifm-font-color-base);
+}
+
+[data-theme='dark'] .warning {
+  background: rgba(255, 152, 0, 0.1);
+}
+
+.info {
+  background: rgba(0, 176, 255, 0.08);
+  border-color: #00b0ff;
+  color: var(--ifm-font-color-base);
+}
+
+[data-theme='dark'] .info {
+  background: rgba(0, 176, 255, 0.1);
+}
+
+.calloutContent p:last-child {
+  margin-bottom: 0;
+}

@@ -1,0 +1,392 @@
+---
+title: "Ingress"
+description: "Roteamento HTTP/HTTPS para serviços internos com TLS, virtual hosting e path-based routing"
+---
+
+# Ingress
+
+O **Ingress** é o ponto de entrada HTTP/HTTPS do cluster. Ele define regras de roteamento que direcionam tráfego externo para os Services internos corretos, baseado em hostname, path ou outros critérios.
+
+```
+Internet
+    │
+    ▼
+[Ingress Controller] ← regras definidas nos recursos Ingress
+    │
+    ├──► /api/*     ──► Service: api-service:80
+    ├──► /admin/*   ──► Service: admin-service:80
+    └──► /*         ──► Service: frontend-service:80
+```
+
+<Note>
+  O recurso `Ingress` define **as regras**. O **Ingress Controller** é o componente que implementa essas regras. Você precisa instalar um Ingress Controller no cluster — o Kubernetes não inclui um por padrão.
+</Note>
+
+## Ingress Controllers Populares
+
+| Controller         | Indicado para                                    |
+|--------------------|--------------------------------------------------|
+| **NGINX Ingress**  | On-premise, bare-metal, uso geral                |
+| **AWS ALB (AWS Load Balancer Controller)** | Clusters EKS na AWS     |
+| **Traefik**        | Cloud-native, suporte nativo a Let's Encrypt     |
+| **Istio Gateway**  | Service mesh com controle avançado de tráfego    |
+| **Contour**        | Baseado em Envoy, alto desempenho                |
+
+---
+
+## Instalando o NGINX Ingress Controller
+
+```bash
+# Via Helm (recomendado)
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.replicaCount=2 \
+  --set controller.nodeSelector."kubernetes\.io/os"=linux \
+  --set controller.admissionWebhooks.enabled=true \
+  --set controller.metrics.enabled=true
+
+# Verificar instalação
+kubectl get pods -n ingress-nginx
+kubectl get service -n ingress-nginx
+```
+
+---
+
+## Ingress Básico
+
+```yaml
+# ingress-basico.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minha-app-ingress
+  namespace: producao
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: minha-app.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minha-app-service
+                port:
+                  number: 80
+```
+
+---
+
+## Ingress com TLS (HTTPS)
+
+### Com cert-manager (Let's Encrypt — recomendado)
+
+```bash
+# Instalar cert-manager
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set installCRDs=true
+```
+
+```yaml
+# clusterissuer-letsencrypt.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: devops@empresa.com.br
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+```
+
+```yaml
+# ingress-tls.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minha-app-ingress
+  namespace: producao
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"   # ← cert-manager gerencia o certificado
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  tls:
+    - hosts:
+        - minha-app.empresa.com.br
+      secretName: minha-app-tls-cert      # Secret criado automaticamente pelo cert-manager
+  rules:
+    - host: minha-app.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minha-app-service
+                port:
+                  number: 80
+```
+
+### Com certificado próprio (Secret manual)
+
+```bash
+kubectl create secret tls minha-app-tls-cert \
+  --cert=./certs/minha-app.crt \
+  --key=./certs/minha-app.key \
+  --namespace=producao
+```
+
+---
+
+## Roteamento por Path (Path-Based Routing)
+
+Direciona diferentes caminhos para serviços distintos:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-gateway-ingress
+  namespace: producao
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  tls:
+    - hosts:
+        - api.empresa.com.br
+      secretName: api-tls-cert
+  rules:
+    - host: api.empresa.com.br
+      http:
+        paths:
+          - path: /api/v1/users
+            pathType: Prefix
+            backend:
+              service:
+                name: users-service
+                port:
+                  number: 80
+
+          - path: /api/v1/orders
+            pathType: Prefix
+            backend:
+              service:
+                name: orders-service
+                port:
+                  number: 80
+
+          - path: /api/v1/payments
+            pathType: Prefix
+            backend:
+              service:
+                name: payments-service
+                port:
+                  number: 80
+
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+```
+
+### Tipos de PathType
+
+| Tipo          | Comportamento                                                     |
+|---------------|-------------------------------------------------------------------|
+| `Prefix`      | Qualquer caminho que **comece** com o prefixo especificado        |
+| `Exact`       | Correspondência **exata** do caminho                              |
+| `ImplementationSpecific` | Comportamento definido pelo Ingress Controller          |
+
+---
+
+## Virtual Hosting (Múltiplos Domínios)
+
+Um único Ingress pode gerenciar múltiplos domínios:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multi-host-ingress
+  namespace: producao
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+    - hosts:
+        - app.empresa.com.br
+        - api.empresa.com.br
+        - admin.empresa.com.br
+      secretName: empresa-tls-wildcard
+  rules:
+    - host: app.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+
+    - host: api.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+
+    - host: admin.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-service
+                port:
+                  number: 80
+```
+
+---
+
+## Anotações Úteis do NGINX Ingress
+
+```yaml
+metadata:
+  annotations:
+    # Reescrita de URL (remove o prefixo do path antes de encaminhar)
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    # Exemplo: /api/v1/users → /users no serviço de destino
+
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+
+    # Tamanho máximo de upload
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+
+    # CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.empresa.com.br"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+
+    # Whitelist de IPs
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,203.0.113.0/24"
+
+    # Autenticação básica (Basic Auth)
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic-auth-secret
+    nginx.ingress.kubernetes.io/auth-realm: "Area Restrita"
+
+    # Headers customizados para o upstream
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Forwarded-Proto: https";
+      more_set_headers "X-Real-IP: $remote_addr";
+```
+
+---
+
+## IngressClass — Múltiplos Controllers
+
+Quando há mais de um Ingress Controller no cluster:
+
+```yaml
+# ingressclass.yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx-producao
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+spec:
+  controller: k8s.io/ingress-nginx
+```
+
+```yaml
+# Referenciando no Ingress
+spec:
+  ingressClassName: nginx-producao
+```
+
+---
+
+## Verificação e Debugging
+
+```bash
+# Listar Ingresses
+kubectl get ingress -n producao
+
+# Detalhar um Ingress (ver regras e backend)
+kubectl describe ingress minha-app-ingress -n producao
+
+# Verificar se o cert-manager emitiu o certificado
+kubectl get certificate -n producao
+kubectl describe certificate minha-app-tls-cert -n producao
+
+# Ver logs do Ingress Controller
+kubectl logs -n ingress-nginx \
+  -l app.kubernetes.io/name=ingress-nginx \
+  --tail=100 -f
+
+# Testar roteamento localmente (sem alterar DNS)
+curl -H "Host: minha-app.empresa.com.br" http://<IP-DO-INGRESS-CONTROLLER>/api/health
+
+# Verificar IP externo do Ingress Controller
+kubectl get service -n ingress-nginx ingress-nginx-controller
+```
+
+---
+
+## Diagrama Completo do Fluxo
+
+```
+Internet
+    │
+    ▼
+DNS: minha-app.empresa.com.br → IP do LoadBalancer
+    │
+    ▼
+Service: ingress-nginx-controller (LoadBalancer)
+    │
+    ▼
+Ingress Controller (Pod NGINX)
+    │  ← lê as regras dos recursos Ingress
+    ├──► Host: minha-app.empresa.com.br / path: /api → Service: api-service → Pods
+    └──► Host: minha-app.empresa.com.br / path: /   → Service: frontend-service → Pods
+```

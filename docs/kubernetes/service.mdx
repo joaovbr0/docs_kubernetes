@@ -1,0 +1,317 @@
+---
+title: "Service"
+description: "Exposição estável de Pods via Service — ClusterIP, NodePort, LoadBalancer e Headless"
+---
+
+# Service
+
+Um **Service** é uma abstração de rede que expõe um conjunto de Pods como um endpoint estável. Como Pods são efêmeros e seus IPs mudam, o Service fornece um IP e DNS fixos que se mantêm mesmo quando Pods são reiniciados ou substituídos.
+
+O Service usa **label selectors** para descobrir os Pods que deve balancear:
+
+```
+Cliente ──► Service (IP fixo) ──► [Pod-1] [Pod-2] [Pod-3]
+                  └─ seleciona por label: app=minha-app
+```
+
+## Tipos de Service
+
+<CardGroup cols={2}>
+  <Card title="ClusterIP" icon="network-wired">
+    Exposição **interna** ao cluster. Não acessível externamente. Padrão quando nenhum tipo é especificado.
+  </Card>
+  <Card title="NodePort" icon="server">
+    Expõe o Service em uma porta de cada nó do cluster. Acessível externamente via `<NodeIP>:<NodePort>`.
+  </Card>
+  <Card title="LoadBalancer" icon="cloud">
+    Provisiona um load balancer externo no provedor de cloud (AWS ALB/NLB, GCP, Azure). Recomendado para produção em cloud.
+  </Card>
+  <Card title="Headless" icon="circle-nodes">
+    Sem IP fixo. Retorna os IPs individuais dos Pods via DNS. Usado por StatefulSets e service meshes.
+  </Card>
+</CardGroup>
+
+---
+
+## ClusterIP — Comunicação Interna
+
+O mais comum. Ideal para comunicação entre serviços dentro do cluster (microserviços, banco de dados, cache):
+
+```yaml
+# service-clusterip.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minha-app-service
+  namespace: producao
+  labels:
+    app: minha-app
+spec:
+  type: ClusterIP          # Padrão — pode ser omitido
+  selector:
+    app: minha-app         # Seleciona todos os Pods com este label
+  ports:
+    - name: http
+      port: 80             # Porta que o Service expõe internamente
+      targetPort: 3000     # Porta do container no Pod
+      protocol: TCP
+```
+
+### DNS interno gerado automaticamente
+
+```
+<service-name>.<namespace>.svc.cluster.local
+
+# Exemplos:
+minha-app-service.producao.svc.cluster.local
+postgres-service.producao.svc.cluster.local:5432
+redis-service.producao.svc.cluster.local:6379
+```
+
+### Comunicação entre namespaces
+
+```bash
+# Dentro do mesmo namespace (nome curto)
+curl http://minha-app-service/api/health
+
+# Entre namespaces diferentes (nome completo)
+curl http://minha-app-service.producao.svc.cluster.local/api/health
+```
+
+---
+
+## NodePort — Acesso Externo via Nó
+
+Expõe o serviço em uma porta fixa em todos os nós. Útil para dev/staging ou quando não há um cloud load balancer:
+
+```yaml
+# service-nodeport.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minha-app-nodeport
+  namespace: producao
+spec:
+  type: NodePort
+  selector:
+    app: minha-app
+  ports:
+    - name: http
+      port: 80            # Porta interna do Service
+      targetPort: 3000    # Porta do container
+      nodePort: 30080     # Porta no nó (range: 30000-32767)
+      protocol: TCP
+```
+
+Acesso externo:
+
+```
+http://<IP-do-nó>:30080
+```
+
+<Note>
+  NodePort não é recomendado para produção em cloud. Prefira `LoadBalancer` ou Ingress para exposição externa.
+</Note>
+
+---
+
+## LoadBalancer — Produção em Cloud
+
+Provisiona automaticamente um load balancer no provedor de cloud:
+
+```yaml
+# service-loadbalancer.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minha-app-lb
+  namespace: producao
+  annotations:
+    # Anotações específicas por provedor de cloud:
+
+    # AWS — Network Load Balancer
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+
+    # GCP — Internal Load Balancer
+    # cloud.google.com/load-balancer-type: "Internal"
+
+    # Azure
+    # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: minha-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+    - name: https
+      port: 443
+      targetPort: 3000
+  # IP fixo (se suportado pelo provedor)
+  # loadBalancerIP: "34.100.200.50"
+
+  # Restringe acesso por IP de origem
+  loadBalancerSourceRanges:
+    - "10.0.0.0/8"
+    - "203.0.113.0/24"
+```
+
+```bash
+# Verificar o IP externo provisionado
+kubectl get service minha-app-lb -n producao
+# NAME            TYPE           CLUSTER-IP      EXTERNAL-IP      PORT(S)
+# minha-app-lb    LoadBalancer   10.96.100.25    34.100.200.50    80:30080/TCP
+```
+
+---
+
+## Headless Service — StatefulSets e Service Mesh
+
+Um Service headless não tem IP próprio — o DNS retorna os IPs individuais dos Pods. Necessário para `StatefulSet`:
+
+```yaml
+# service-headless.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: producao
+spec:
+  type: ClusterIP
+  clusterIP: None        # ← Define como Headless
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+```
+
+O DNS resolve individualmente cada Pod do StatefulSet:
+
+```
+postgres-0.postgres-headless.producao.svc.cluster.local
+postgres-1.postgres-headless.producao.svc.cluster.local
+postgres-2.postgres-headless.producao.svc.cluster.local
+```
+
+---
+
+## ExternalName — Alias para Serviços Externos
+
+Cria um alias DNS para um serviço fora do cluster. Útil para migração gradual ou acesso a serviços externos:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: banco-externo
+  namespace: producao
+spec:
+  type: ExternalName
+  externalName: banco.empresa.com.br   # Resolve para este FQDN externo
+```
+
+Pods do namespace podem acessar `banco-externo` e o DNS resolve para `banco.empresa.com.br`.
+
+---
+
+## Service com Múltiplas Portas
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: minha-app-multi-port
+  namespace: producao
+spec:
+  selector:
+    app: minha-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP
+```
+
+<Note>
+  Quando um Service tem múltiplas portas, o campo `name` em cada porta é **obrigatório**.
+</Note>
+
+---
+
+## Session Affinity (Sticky Sessions)
+
+Direciona requisições do mesmo cliente para o mesmo Pod:
+
+```yaml
+spec:
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600   # Mantém afinidade por 1 hora
+```
+
+---
+
+## Verificar Endpoints
+
+O Service descobre os Pods através de `Endpoints`. Se um Service não roteia tráfego, verifique:
+
+```bash
+# Ver os Pods que o Service está selecionando
+kubectl get endpoints minha-app-service -n producao
+
+# Deve mostrar IPs dos Pods rodando:
+# NAME                  ENDPOINTS                         AGE
+# minha-app-service     10.244.1.5:3000,10.244.2.3:3000   5d
+
+# Se ENDPOINTS estiver <none>, o selector não está batendo com os labels dos Pods
+kubectl get pods -n producao -l app=minha-app
+kubectl describe service minha-app-service -n producao
+```
+
+---
+
+## Comparativo dos Tipos
+
+| Tipo            | Acesso externo | Custo adicional | Quando usar                          |
+|-----------------|---------------|-----------------|--------------------------------------|
+| `ClusterIP`     | Não            | Nenhum          | Comunicação interna entre serviços   |
+| `NodePort`      | Sim (via nó)   | Nenhum          | Dev/staging, on-premise simples      |
+| `LoadBalancer`  | Sim (cloud LB) | LB do provedor  | Produção em cloud com IP público     |
+| `Headless`      | Não            | Nenhum          | StatefulSets, service mesh           |
+| `ExternalName`  | (saída)        | Nenhum          | Proxy para serviços externos         |
+
+---
+
+## Comandos de Referência
+
+```bash
+# Listar Services
+kubectl get services -n producao
+kubectl get svc -n producao
+
+# Detalhar um Service
+kubectl describe svc minha-app-service -n producao
+
+# Ver endpoints
+kubectl get endpoints -n producao
+
+# Testar conectividade a partir de um Pod temporário
+kubectl run teste-dns --image=busybox:1.36 --rm -it --restart=Never \
+  --namespace=producao \
+  -- nslookup minha-app-service
+
+# Port-forward para acessar o Service localmente
+kubectl port-forward svc/minha-app-service 8080:80 -n producao
+```

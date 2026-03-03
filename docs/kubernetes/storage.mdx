@@ -1,0 +1,487 @@
+---
+title: "Storage no Kubernetes"
+description: "Configure volumes persistentes com PersistentVolume, PersistentVolumeClaim e StorageClass para produção"
+---
+
+# Storage no Kubernetes
+
+Containers são efêmeros por natureza — ao reiniciar um Pod, todos os dados gravados no sistema de arquivos são perdidos. Para aplicações stateful (bancos de dados, uploads, cache, logs) é essencial configurar **armazenamento persistente**.
+
+O Kubernetes oferece três abstrações principais para isso:
+
+<CardGroup cols={3}>
+  <Card title="PersistentVolume (PV)" icon="hard-drive">
+    Representa um disco físico ou lógico provisionado no cluster. É um recurso do cluster, não de um namespace específico.
+  </Card>
+  <Card title="PersistentVolumeClaim (PVC)" icon="file-check">
+    Requisição de armazenamento feita por uma aplicação. É consumida por Pods e vive dentro de um namespace.
+  </Card>
+  <Card title="StorageClass (SC)" icon="layer-group">
+    Define como os volumes são provisionados dinamicamente. Abstrai o tipo de storage (SSD, HDD, NFS, cloud).
+  </Card>
+</CardGroup>
+
+---
+
+## Conceitos Fundamentais
+
+### Ciclo de Vida do Storage
+
+```
+StorageClass ──► PersistentVolume (PV) ──► PersistentVolumeClaim (PVC) ──► Pod
+   (como)           (o disco real)           (a requisição)            (quem usa)
+```
+
+### Modos de Acesso
+
+| Modo                    | Sigla  | Descrição                                              |
+|-------------------------|--------|--------------------------------------------------------|
+| `ReadWriteOnce`         | RWO    | Leitura/escrita por **um único nó** por vez            |
+| `ReadOnlyMany`          | ROX    | Leitura por **múltiplos nós** simultaneamente          |
+| `ReadWriteMany`         | RWX    | Leitura/escrita por **múltiplos nós** (NFS, CephFS)    |
+| `ReadWriteOncePod`      | RWOP   | Leitura/escrita por **um único Pod** (Kubernetes 1.22+)|
+
+### Políticas de Retenção (`reclaimPolicy`)
+
+| Política    | Comportamento após o PVC ser deletado                    |
+|-------------|----------------------------------------------------------|
+| `Retain`    | PV permanece com os dados; requer ação manual para limpar |
+| `Delete`    | PV e o volume subjacente são deletados automaticamente   |
+| `Recycle`   | Deprecado — use `Delete` ou `Retain`                     |
+
+<Warning>
+  Em produção, prefira `Retain` para evitar perda acidental de dados ao deletar um PVC.
+</Warning>
+
+---
+
+## StorageClass
+
+A `StorageClass` permite o **provisionamento dinâmico** de volumes: o Kubernetes cria o PV automaticamente quando um PVC é solicitado.
+
+### StorageClass para NFS (on-premise)
+
+```yaml
+# storageclass-nfs.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-storage
+provisioner: nfs.csi.k8s.io       # Requer nfs-csi-driver instalado no cluster
+parameters:
+  server: 192.168.1.50             # IP do servidor NFS
+  share: /exports/kubernetes       # Caminho exportado no servidor NFS
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1
+  - hard
+  - timeo=600
+```
+
+### StorageClass para AWS EBS
+
+```yaml
+# storageclass-aws-ebs.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer   # Aguarda o Pod ser agendado antes de criar o volume
+allowVolumeExpansion: true
+```
+
+### StorageClass para GCP Persistent Disk
+
+```yaml
+# storageclass-gcp.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gcp-pd-ssd
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+```
+
+```bash
+# Aplicar a StorageClass
+kubectl apply -f storageclass-nfs.yaml
+
+# Verificar as StorageClasses disponíveis no cluster
+kubectl get storageclass
+```
+
+---
+
+## PersistentVolume (PV)
+
+O PV representa o disco físico. Em provisionamento **estático**, ele é criado manualmente; em provisionamento **dinâmico** (via StorageClass), é criado automaticamente.
+
+### PV Estático — NFS
+
+```yaml
+# pv-nfs.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-app-dados
+  labels:
+    app: minha-app
+    tier: storage
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteMany          # NFS suporta múltiplos escritores
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: nfs-storage
+  nfs:
+    server: 192.168.1.50
+    path: /exports/kubernetes/minha-app
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+```
+
+### PV Estático — HostPath (apenas para dev/lab)
+
+```yaml
+# pv-hostpath.yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-local-dev
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  hostPath:
+    path: /mnt/dados/minha-app
+    type: DirectoryOrCreate
+```
+
+<Warning>
+  `hostPath` armazena dados no nó específico do cluster. Se o Pod for reagendado para outro nó, os dados **não estarão disponíveis**. Use apenas para desenvolvimento ou testes locais.
+</Warning>
+
+```bash
+# Aplicar e verificar o PV
+kubectl apply -f pv-nfs.yaml
+kubectl get pv
+kubectl describe pv pv-app-dados
+```
+
+---
+
+## PersistentVolumeClaim (PVC)
+
+O PVC é a requisição de armazenamento feita pela aplicação. Ele faz o **binding** com um PV disponível que atenda aos critérios.
+
+### PVC com provisionamento dinâmico
+
+```yaml
+# pvc-app.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-minha-app
+  namespace: producao
+  labels:
+    app: minha-app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ebs-gp3      # Referência à StorageClass que provisionará o PV
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+### PVC com binding a um PV específico (estático)
+
+```yaml
+# pvc-nfs.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-dados-compartilhados
+  namespace: producao
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: nfs-storage
+  resources:
+    requests:
+      storage: 50Gi
+  selector:
+    matchLabels:
+      app: minha-app             # Seleciona o PV com este label
+```
+
+```bash
+# Aplicar e verificar o PVC
+kubectl apply -f pvc-app.yaml --namespace=producao
+
+# Verificar status (deve ficar Bound)
+kubectl get pvc --namespace=producao
+kubectl describe pvc pvc-minha-app --namespace=producao
+```
+
+Os estados do PVC são:
+
+| Estado    | Significado                                               |
+|-----------|-----------------------------------------------------------|
+| `Pending` | Aguardando um PV compatível ou provisionamento dinâmico   |
+| `Bound`   | Vinculado a um PV — pronto para uso                       |
+| `Lost`    | O PV associado não existe mais                            |
+
+---
+
+## Usar o PVC em um Deployment
+
+```yaml
+# deployment-com-storage.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minha-app
+  namespace: producao
+spec:
+  replicas: 1                   # Para RWO, apenas 1 réplica pode montar o volume
+  selector:
+    matchLabels:
+      app: minha-app
+  template:
+    metadata:
+      labels:
+        app: minha-app
+    spec:
+      imagePullSecrets:
+        - name: gitlab-registry-secret
+      containers:
+        - name: minha-app
+          image: registry.gitlab.com/minha-empresa/minha-app:1.0.0
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: dados-persistentes
+              mountPath: /app/uploads    # Caminho dentro do container
+            - name: logs
+              mountPath: /app/logs
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: dados-persistentes
+          persistentVolumeClaim:
+            claimName: pvc-minha-app    # <── Nome do PVC criado anteriormente
+        - name: logs
+          emptyDir: {}                   # Volume temporário, resetado ao reiniciar o Pod
+```
+
+---
+
+## StatefulSet com volumeClaimTemplates
+
+Para aplicações stateful (bancos de dados, filas, etc.), use `StatefulSet` com `volumeClaimTemplates`. Ele cria um PVC automaticamente para **cada réplica**, garantindo dados isolados:
+
+```yaml
+# statefulset-postgres.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: producao
+spec:
+  serviceName: postgres-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_DB
+              value: producao
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+  volumeClaimTemplates:                  # <── PVC criado automaticamente por réplica
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: ebs-gp3
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+O StatefulSet criará PVCs nomeados como `postgres-data-postgres-0`, `postgres-data-postgres-1`, etc.
+
+---
+
+## Expandir um Volume
+
+Se a StorageClass tiver `allowVolumeExpansion: true`, é possível aumentar o tamanho do PVC sem downtime (em volumes baseados em cloud):
+
+```bash
+# Editar o PVC e aumentar o storage
+kubectl patch pvc pvc-minha-app \
+  --namespace=producao \
+  -p '{"spec":{"resources":{"requests":{"storage":"40Gi"}}}}'
+
+# Verificar o status da expansão
+kubectl get pvc pvc-minha-app --namespace=producao
+kubectl describe pvc pvc-minha-app --namespace=producao
+```
+
+<Note>
+  Para volumes NFS e HostPath, a expansão de PVC não é suportada diretamente. É necessário criar um novo PV maior e migrar os dados.
+</Note>
+
+---
+
+## Backup e Migração de Dados
+
+### Snapshot de Volume (CSI)
+
+```yaml
+# volumesnapshot.yaml
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: snapshot-minha-app-20240101
+  namespace: producao
+spec:
+  volumeSnapshotClassName: csi-aws-vsc
+  source:
+    persistentVolumeClaimName: pvc-minha-app
+```
+
+```bash
+# Criar snapshot
+kubectl apply -f volumesnapshot.yaml --namespace=producao
+
+# Listar snapshots
+kubectl get volumesnapshot --namespace=producao
+```
+
+### Restaurar a partir de Snapshot
+
+```yaml
+# pvc-from-snapshot.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-restaurado
+  namespace: producao
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ebs-gp3
+  resources:
+    requests:
+      storage: 20Gi
+  dataSource:
+    name: snapshot-minha-app-20240101
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+```
+
+---
+
+## Comandos Úteis
+
+```bash
+# Listar todos os PVs do cluster
+kubectl get pv
+
+# Listar PVCs de um namespace
+kubectl get pvc --namespace=producao
+
+# Inspecionar um PVC
+kubectl describe pvc pvc-minha-app --namespace=producao
+
+# Ver eventos de um Pod com problema de storage
+kubectl describe pod <nome-do-pod> --namespace=producao
+
+# Verificar se o volume está montado corretamente
+kubectl exec -it <nome-do-pod> --namespace=producao -- df -h
+
+# Forçar deletar um PVC preso em Terminating
+kubectl patch pvc pvc-minha-app \
+  --namespace=producao \
+  -p '{"metadata":{"finalizers":null}}'
+```
+
+---
+
+## Boas Práticas
+
+<AccordionGroup>
+  <Accordion title="Use StorageClass com provisionamento dinâmico sempre que possível">
+    Evita o gerenciamento manual de PVs. A maioria dos provedores cloud e soluções como Rook/Ceph suportam provisionamento dinâmico.
+  </Accordion>
+  <Accordion title="Prefira reclaimPolicy: Retain em produção">
+    Protege contra perda acidental de dados. Configure alertas para PVs em estado `Released` para fazer cleanup manual quando necessário.
+  </Accordion>
+  <Accordion title="Use volumeClaimTemplates em StatefulSets">
+    Garante que cada réplica tenha seu próprio volume independente, evitando corrupção de dados por escrita concorrente.
+  </Accordion>
+  <Accordion title="Monitore o uso de disco">
+    Configure alertas no Prometheus/Grafana para notificar quando o uso do PVC ultrapassar 80%. Use `kubelet_volume_stats_used_bytes` e `kubelet_volume_stats_capacity_bytes`.
+  </Accordion>
+  <Accordion title="Implemente política de backup">
+    Use ferramentas como Velero para backup de PVCs e objetos Kubernetes de forma automatizada e consistente.
+  </Accordion>
+</AccordionGroup>

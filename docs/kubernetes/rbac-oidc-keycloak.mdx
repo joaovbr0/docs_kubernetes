@@ -1,0 +1,554 @@
+---
+title: "RBAC com OIDC e Keycloak"
+description: "Autenticação de usuários no Kubernetes via OpenID Connect usando Keycloak como Identity Provider — grupos, tokens e kubectl"
+---
+
+# RBAC com OIDC e Keycloak
+
+Por padrão, o Kubernetes não tem uma base de usuários própria — ele delega autenticação a provedores externos. O **OpenID Connect (OIDC)** é o protocolo padrão para isso, e o **Keycloak** é um dos Identity Providers (IdP) mais usados em ambientes corporativos.
+
+## Como funciona a autenticação OIDC no Kubernetes
+
+```
+1. Usuário faz login no Keycloak
+         │
+         ▼
+2. Keycloak emite um JWT (ID Token)
+         │
+         ▼
+3. kubectl envia o token no header Authorization
+         │
+         ▼
+4. API server valida o token (JWKS do Keycloak)
+         │
+         ▼
+5. API server extrai claims: sub (usuário), groups (grupos)
+         │
+         ▼
+6. RBAC verifica permissões com base no usuário/grupos
+```
+
+O API server **nunca** chama o Keycloak durante a validação — ele verifica o token localmente usando a chave pública (JWKS). Isso torna a autenticação stateless e rápida.
+
+---
+
+## Passo 1 — Configurar o Keycloak
+
+### Instalar o Keycloak no Kubernetes
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+
+helm install keycloak bitnami/keycloak \
+  --namespace keycloak \
+  --create-namespace \
+  --set auth.adminUser=admin \
+  --set auth.adminPassword=SenhaSegura123! \
+  --set ingress.enabled=true \
+  --set ingress.hostname=keycloak.empresa.com.br \
+  --set ingress.annotations."cert-manager\.io/cluster-issuer"=letsencrypt-prod \
+  --set ingress.tls=true \
+  --set postgresql.auth.postgresPassword=pgSenha123!
+```
+
+### Criar o Realm para o Kubernetes
+
+No Keycloak, acesse `https://keycloak.empresa.com.br` e:
+
+<Steps>
+  <Step title="Criar um novo Realm">
+    Clique em **Create Realm**, nomeie como `kubernetes` e habilite.
+  </Step>
+
+  <Step title="Criar um Client para o Kubernetes">
+    Em **Clients → Create client**:
+    - **Client ID:** `kubernetes`
+    - **Client type:** `OpenID Connect`
+    - **Client authentication:** `ON` (confidential)
+    - **Valid redirect URIs:** `http://localhost:8000`, `http://localhost:18000`
+
+    Após salvar, vá em **Credentials** e copie o **Client Secret**.
+  </Step>
+
+  <Step title="Configurar os mappers de grupos">
+    Em **Clients → kubernetes → Client scopes → kubernetes-dedicated → Add mapper → By configuration → Group Membership**:
+    - **Name:** `groups`
+    - **Token Claim Name:** `groups`
+    - **Full group path:** `OFF`
+    - **Add to ID token:** `ON`
+    - **Add to access token:** `ON`
+  </Step>
+
+  <Step title="Criar grupos no Keycloak">
+    Em **Groups → Create group**, crie os grupos que vão mapear para o RBAC do Kubernetes:
+    - `k8s-cluster-admins`
+    - `k8s-platform-operators`
+    - `k8s-team-backend`
+    - `k8s-team-frontend`
+    - `k8s-readonly`
+  </Step>
+
+  <Step title="Criar usuários e atribuir grupos">
+    Em **Users → Create user**, crie os usuários e em **Groups**, associe-os aos grupos correspondentes.
+  </Step>
+</Steps>
+
+### Verificar o JWKS endpoint do Keycloak
+
+O API server usará esse endpoint para obter as chaves públicas de validação do token:
+
+```bash
+curl https://keycloak.empresa.com.br/realms/kubernetes/.well-known/openid-configuration \
+  | jq '{issuer, jwks_uri, token_endpoint}'
+
+# Saída esperada:
+# {
+#   "issuer": "https://keycloak.empresa.com.br/realms/kubernetes",
+#   "jwks_uri": "https://keycloak.empresa.com.br/realms/kubernetes/protocol/openid-connect/certs",
+#   "token_endpoint": "..."
+# }
+```
+
+---
+
+## Passo 2 — Configurar o API Server com OIDC
+
+Os parâmetros OIDC são passados na inicialização do `kube-apiserver`. O método varia conforme a distribuição:
+
+### kubeadm
+
+Edite o manifesto estático do API server:
+
+```bash
+sudo vim /etc/kubernetes/manifests/kube-apiserver.yaml
+```
+
+```yaml
+# /etc/kubernetes/manifests/kube-apiserver.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+  namespace: kube-system
+spec:
+  containers:
+    - name: kube-apiserver
+      command:
+        - kube-apiserver
+        # ── Flags OIDC ────────────────────────────────────────────
+        - --oidc-issuer-url=https://keycloak.empresa.com.br/realms/kubernetes
+        - --oidc-client-id=kubernetes
+        - --oidc-username-claim=email         # Claim usado como nome do usuário
+        - --oidc-username-prefix=oidc:        # Prefixo para evitar colisão com users locais
+        - --oidc-groups-claim=groups          # Claim que contém os grupos
+        - --oidc-groups-prefix=oidc:          # Prefixo para grupos
+        # CA do Keycloak (se certificado interno)
+        - --oidc-ca-file=/etc/kubernetes/pki/keycloak-ca.crt
+        # ── Demais flags existentes ───────────────────────────────
+        - --advertise-address=...
+        - --allow-privileged=true
+        # ...
+```
+
+<Note>
+  Após salvar, o kubelet detecta a mudança e reinicia o API server automaticamente em ~30 segundos. Monitore com `kubectl get pods -n kube-system -w`.
+</Note>
+
+### K3s
+
+```bash
+# /etc/rancher/k3s/config.yaml
+kube-apiserver-arg:
+  - "oidc-issuer-url=https://keycloak.empresa.com.br/realms/kubernetes"
+  - "oidc-client-id=kubernetes"
+  - "oidc-username-claim=email"
+  - "oidc-username-prefix=oidc:"
+  - "oidc-groups-claim=groups"
+  - "oidc-groups-prefix=oidc:"
+```
+
+```bash
+sudo systemctl restart k3s
+```
+
+### RKE2
+
+```yaml
+# /etc/rancher/rke2/config.yaml
+kube-apiserver-arg:
+  - "oidc-issuer-url=https://keycloak.empresa.com.br/realms/kubernetes"
+  - "oidc-client-id=kubernetes"
+  - "oidc-username-claim=email"
+  - "oidc-username-prefix=oidc:"
+  - "oidc-groups-claim=groups"
+  - "oidc-groups-prefix=oidc:"
+```
+
+### Verificar que os flags foram aplicados
+
+```bash
+kubectl get pod kube-apiserver-<node> -n kube-system -o yaml \
+  | grep oidc
+```
+
+---
+
+## Passo 3 — Criar RoleBindings para os Grupos Keycloak
+
+Com o prefixo `oidc:`, os grupos do Keycloak ficam como `oidc:k8s-team-backend` no Kubernetes:
+
+```yaml
+# rbac-grupos-keycloak.yaml
+
+# ── Cluster Admins (acesso total) ─────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-cluster-admins
+subjects:
+  - kind: Group
+    name: "oidc:k8s-cluster-admins"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Platform Operators (operar recursos de cluster, não apps) ─────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-platform-operators
+subjects:
+  - kind: Group
+    name: "oidc:k8s-platform-operators"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: platform-operator        # ClusterRole customizada (da página RBAC)
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Team Backend — acesso de deploy no namespace producao ─────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oidc-backend-deploy
+  namespace: producao
+subjects:
+  - kind: Group
+    name: "oidc:k8s-team-backend"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: deployer                 # ClusterRole reutilizada no namespace
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Team Frontend — acesso de deploy no namespace producao ────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oidc-frontend-deploy
+  namespace: producao
+subjects:
+  - kind: Group
+    name: "oidc:k8s-team-frontend"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: deployer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── Readonly — leitura em todos os namespaces ─────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oidc-readonly-all
+subjects:
+  - kind: Group
+    name: "oidc:k8s-readonly"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+```bash
+kubectl apply -f rbac-grupos-keycloak.yaml
+```
+
+---
+
+## Passo 4 — Configurar o kubectl com OIDC
+
+O usuário precisa obter um token do Keycloak e configurar o kubectl para usá-lo.
+
+### Opção A: kubelogin (recomendado)
+
+O **kubelogin** é um plugin oficial do kubectl para OIDC que abre um browser para login e gerencia a renovação do token automaticamente:
+
+```bash
+# Instalar o kubelogin
+# macOS
+brew install int128/kubelogin/kubelogin
+
+# Linux
+curl -LO https://github.com/int128/kubelogin/releases/latest/download/kubelogin_linux_amd64.zip
+unzip kubelogin_linux_amd64.zip
+sudo mv kubelogin /usr/local/bin/kubectl-oidc_login
+
+# Windows (via Chocolatey)
+choco install kubelogin
+```
+
+#### Configurar o kubeconfig
+
+```bash
+# Adicionar o usuário OIDC ao kubeconfig
+kubectl config set-credentials oidc-user \
+  --exec-api-version=client.authentication.k8s.io/v1beta1 \
+  --exec-command=kubectl \
+  --exec-arg=oidc-login \
+  --exec-arg=get-token \
+  --exec-arg=--oidc-issuer-url=https://keycloak.empresa.com.br/realms/kubernetes \
+  --exec-arg=--oidc-client-id=kubernetes \
+  --exec-arg=--oidc-client-secret=<CLIENT-SECRET-DO-KEYCLOAK> \
+  --exec-arg=--oidc-extra-scope=groups \
+  --exec-arg=--oidc-extra-scope=email
+
+# Criar contexto apontando para o cluster e o usuário OIDC
+kubectl config set-context producao-oidc \
+  --cluster=producao \
+  --user=oidc-user \
+  --namespace=producao
+
+# Usar o contexto
+kubectl config use-context producao-oidc
+```
+
+O kubeconfig resultante fica assim:
+
+```yaml
+# ~/.kube/config
+users:
+  - name: oidc-user
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1beta1
+        command: kubectl
+        args:
+          - oidc-login
+          - get-token
+          - --oidc-issuer-url=https://keycloak.empresa.com.br/realms/kubernetes
+          - --oidc-client-id=kubernetes
+          - --oidc-client-secret=<CLIENT-SECRET>
+          - --oidc-extra-scope=groups
+          - --oidc-extra-scope=email
+```
+
+#### Primeiro login
+
+```bash
+# Na primeira execução, abre o browser para autenticação
+kubectl get pods -n producao
+
+# Browser abre: https://keycloak.empresa.com.br/realms/kubernetes/...
+# Usuário faz login normalmente
+# Token é armazenado em ~/.kube/cache/oidc-login/
+```
+
+O kubelogin renova o token automaticamente usando o refresh token antes de expirar.
+
+---
+
+### Opção B: Configuração manual com token direto
+
+Para ambientes sem browser (pipelines, scripts):
+
+```bash
+# Buscar token via Device Flow ou Resource Owner Password (somente dev/debug)
+TOKEN=$(curl -sf \
+  --request POST \
+  "https://keycloak.empresa.com.br/realms/kubernetes/protocol/openid-connect/token" \
+  --data "grant_type=password" \
+  --data "client_id=kubernetes" \
+  --data "client_secret=<CLIENT-SECRET>" \
+  --data "username=joao@empresa.com" \
+  --data "password=SenhaDoUsuario" \
+  --data "scope=openid email groups" \
+  | jq -r '.id_token')
+
+# Verificar claims do token
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | jq '{sub, email, groups}'
+
+# Usar o token diretamente no kubeconfig
+kubectl config set-credentials joao-manual \
+  --token=$TOKEN
+
+# Ou passar direto no comando
+kubectl get pods -n producao \
+  --token=$TOKEN
+```
+
+---
+
+### Opção C: kubeconfig distribuído via Keycloak (para times)
+
+Gere um kubeconfig padronizado para distribuir ao time sem expor o client secret:
+
+```bash
+# Script para gerar kubeconfig personalizado
+#!/bin/bash
+CLUSTER_NAME="producao"
+API_SERVER="https://k8s-api.empresa.com.br:6443"
+KEYCLOAK_URL="https://keycloak.empresa.com.br/realms/kubernetes"
+CLIENT_ID="kubernetes"
+CA_DATA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+
+cat > ~/kubeconfig-${CLUSTER_NAME}.yaml <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+  - name: ${CLUSTER_NAME}
+    cluster:
+      server: ${API_SERVER}
+      certificate-authority-data: ${CA_DATA}
+contexts:
+  - name: ${CLUSTER_NAME}
+    context:
+      cluster: ${CLUSTER_NAME}
+      user: oidc-user
+current-context: ${CLUSTER_NAME}
+users:
+  - name: oidc-user
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1beta1
+        command: kubectl
+        args:
+          - oidc-login
+          - get-token
+          - --oidc-issuer-url=${KEYCLOAK_URL}
+          - --oidc-client-id=${CLIENT_ID}
+          - --oidc-extra-scope=groups
+          - --oidc-extra-scope=email
+          - --browser-command=xdg-open   # Linux; use "open" no macOS
+EOF
+
+echo "kubeconfig gerado: ~/kubeconfig-${CLUSTER_NAME}.yaml"
+echo "Use: export KUBECONFIG=~/kubeconfig-${CLUSTER_NAME}.yaml"
+```
+
+<Note>
+  Com `--oidc-client-id` sem `--oidc-client-secret`, o Keycloak usa **Public Client** (sem secret). Configure o client como público no Keycloak para este cenário.
+</Note>
+
+---
+
+## Verificação e Debugging
+
+```bash
+# Testar quem você é no cluster
+kubectl auth whoami
+# ATTRIBUTE   VALUE
+# Username    oidc:joao@empresa.com
+# Groups      [oidc:k8s-team-backend oidc:k8s-readonly system:authenticated]
+
+# Listar permissões do usuário atual
+kubectl auth can-i --list -n producao
+
+# Inspecionar o token JWT atual
+kubectl config view --raw -o jsonpath='{.users[?(@.name=="oidc-user")].user.token}' \
+  | cut -d. -f2 | base64 -d 2>/dev/null | jq '{sub, email, groups, exp: (.exp | todate)}'
+
+# Testar autenticação com o token diretamente
+curl -k \
+  -H "Authorization: Bearer $TOKEN" \
+  https://k8s-api.empresa.com.br:6443/api/v1/namespaces/producao/pods \
+  | jq '.items[].metadata.name'
+
+# Ver logs do API server (erros de validação do token)
+kubectl logs kube-apiserver-<node> -n kube-system \
+  | grep -i "oidc\|jwt\|token"
+```
+
+### Falhas comuns
+
+<AccordionGroup>
+  <Accordion title='erro: "oidc: issuer did not match"'>
+    O `--oidc-issuer-url` no API server não bate com o claim `iss` do token. Verifique:
+
+    ```bash
+    # Ver o issuer real do token
+    echo $TOKEN | cut -d. -f2 | base64 -d | jq '.iss'
+    # Deve ser exatamente igual ao --oidc-issuer-url configurado no API server
+    ```
+  </Accordion>
+
+  <Accordion title='erro: "oidc: groups claim not found in token"'>
+    O mapper de grupos não está configurado corretamente no Keycloak. Verifique:
+    - O mapper existe em **Client scopes → kubernetes-dedicated**
+    - O **Token Claim Name** é exatamente `groups`
+    - **Add to ID token** está `ON`
+    - O usuário está associado a pelo menos um grupo no Keycloak
+  </Accordion>
+
+  <Accordion title='erro: "User cannot be authenticated with the provided credentials"'>
+    O client secret está errado ou o token expirou. Limpe o cache do kubelogin:
+
+    ```bash
+    rm -rf ~/.kube/cache/oidc-login/
+    kubectl get pods   # Força novo login
+    ```
+  </Accordion>
+
+  <Accordion title="RoleBinding não funciona — permissão negada mesmo com grupo correto">
+    Verifique o prefixo do grupo. Com `--oidc-groups-prefix=oidc:`, o grupo `k8s-team-backend`
+    vira `oidc:k8s-team-backend` no RBAC:
+
+    ```bash
+    # Ver como o API server enxerga o usuário
+    kubectl auth whoami
+    # Groups: [oidc:k8s-team-backend ...]
+
+    # O RoleBinding deve usar o nome com prefixo
+    kubectl get rolebinding -n producao -o yaml | grep -A3 subjects
+    # name: "oidc:k8s-team-backend"  ← com prefixo oidc:
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Fluxo Completo Visual
+
+```
+Desenvolvedor                  Keycloak                    Kubernetes
+     │                            │                              │
+     │── Login (browser) ────────►│                              │
+     │                            │── Valida credenciais         │
+     │◄── JWT (id_token) ─────────│                              │
+     │                            │                              │
+     │── kubectl get pods ─────────────────────────────────────►│
+     │   (Authorization: Bearer <jwt>)                           │
+     │                            │                              │
+     │                            │         API server valida JWT│
+     │                            │         via JWKS público do  │
+     │                            │◄── GET /.well-known/jwks     │
+     │                            │── JWKS keys ────────────────►│
+     │                            │                              │
+     │                            │         Extrai claims:       │
+     │                            │         user: joao@empresa   │
+     │                            │         groups: [k8s-backend]│
+     │                            │                              │
+     │                            │         RBAC verifica:       │
+     │                            │         oidc:k8s-backend     │
+     │                            │         tem RoleBinding?     │
+     │                            │         → SIM → executa      │
+     │◄── Resposta ────────────────────────────────────────────── │
+```

@@ -1,0 +1,618 @@
+---
+title: "cert-manager"
+description: "Gerenciamento e renovação automática de certificados TLS no Kubernetes com Let's Encrypt, CA interna e Vault PKI"
+---
+
+# cert-manager
+
+O **cert-manager** é o controlador padrão de certificados TLS no Kubernetes. Ele automatiza todo o ciclo de vida dos certificados: **emissão**, **renovação** e **rotação** — eliminando a necessidade de gerenciar arquivos `.crt`/`.key` manualmente ou lembrar de renovar antes do vencimento.
+
+## Como funciona
+
+```
+Você declara um Certificate (ou um Ingress com anotação)
+         │
+         ▼
+cert-manager lê o recurso e identifica o Issuer
+         │
+         ▼
+Issuer realiza o desafio de validação (HTTP-01, DNS-01)
+         │
+         ▼
+CA emite o certificado → cert-manager armazena em um Secret TLS
+         │
+         ▼
+Ingress/Traefik lê o Secret e serve o certificado HTTPS
+         │
+         ▼ (30 dias antes do vencimento)
+cert-manager renova automaticamente → atualiza o Secret
+```
+
+## CRDs do cert-manager
+
+| Recurso             | Escopo      | Finalidade                                                    |
+|---------------------|-------------|---------------------------------------------------------------|
+| `Issuer`            | Namespace   | Define **uma** fonte emissora para um namespace específico    |
+| `ClusterIssuer`     | Cluster     | Define uma fonte emissora global para todos os namespaces     |
+| `Certificate`       | Namespace   | Solicita explicitamente um certificado de um Issuer           |
+| `CertificateRequest`| Namespace   | Criado automaticamente pelo cert-manager (não edite)          |
+| `Order`             | Namespace   | Representa um pedido ACME em andamento                        |
+| `Challenge`         | Namespace   | Representa um desafio HTTP-01 ou DNS-01 em andamento          |
+
+---
+
+## Instalação
+
+```bash
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set crds.enabled=true \
+  --set prometheus.enabled=true \
+  --set webhook.timeoutSeconds=30
+
+# Verificar pods
+kubectl get pods -n cert-manager
+# cert-manager-xxx            Running
+# cert-manager-cainjector-xxx Running
+# cert-manager-webhook-xxx    Running
+```
+
+---
+
+## Issuers — Fontes de Certificados
+
+### ClusterIssuer Let's Encrypt (HTTP-01)
+
+O desafio **HTTP-01** é o mais simples: o cert-manager cria um endpoint temporário em `/.well-known/acme-challenge/` que a Let's Encrypt acessa para provar que você controla o domínio.
+
+<Note>
+  Requer que o domínio seja acessível pela internet na porta 80. Não suporta certificados wildcard.
+</Note>
+
+```yaml
+# clusterissuer-letsencrypt-http01.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: devops@empresa.com.br
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key   # Chave da conta ACME — gerada automaticamente
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx         # ou "traefik"
+```
+
+```yaml
+# Para staging (sem limite de rate — use para testar)
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: devops@empresa.com.br
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+```
+
+<Tip>
+  Sempre teste com `letsencrypt-staging` primeiro. A produção tem limite de **5 certificados por domínio por semana** — erros de configuração podem queimar esse limite.
+</Tip>
+
+---
+
+### ClusterIssuer Let's Encrypt (DNS-01) — Certificados Wildcard
+
+O desafio **DNS-01** prova controle do domínio criando um registro TXT no DNS. É o **único método** que suporta certificados wildcard (`*.empresa.com.br`) e funciona em ambientes sem acesso externo (air-gapped com DNS interno).
+
+#### DNS-01 com Route53 (AWS)
+
+```yaml
+# clusterissuer-letsencrypt-dns01-route53.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod-dns
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: devops@empresa.com.br
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: us-east-1
+            hostedZoneID: Z1234567890ABC    # ID da hosted zone no Route53
+            accessKeyIDSecretRef:
+              name: route53-credentials
+              key: access-key-id
+            secretAccessKeySecretRef:
+              name: route53-credentials
+              key: secret-access-key
+        selector:
+          dnsZones:
+            - "empresa.com.br"             # Aplica apenas nesta zona
+```
+
+```bash
+kubectl create secret generic route53-credentials \
+  --from-literal=access-key-id=AKIAIOSFODNN7EXAMPLE \
+  --from-literal=secret-access-key=wJalrXUtnFEMI... \
+  --namespace cert-manager
+```
+
+#### DNS-01 com Cloudflare
+
+```yaml
+# clusterissuer-letsencrypt-dns01-cloudflare.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod-dns
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: devops@empresa.com.br
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - dns01:
+          cloudflare:
+            email: devops@empresa.com.br
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+```
+
+```bash
+kubectl create secret generic cloudflare-api-token \
+  --from-literal=api-token=<TOKEN-DA-CLOUDFLARE> \
+  --namespace cert-manager
+```
+
+---
+
+### CA Interna (certificados self-signed para uso interno)
+
+Ideal para comunicação interna entre serviços, ambientes on-premise sem acesso à internet ou testes.
+
+#### Passo 1 — Criar a CA raiz
+
+```bash
+# Gerar chave e certificado da CA raiz
+openssl genrsa -out ca.key 4096
+openssl req -new -x509 -days 3650 -key ca.key \
+  -out ca.crt \
+  -subj "/CN=Empresa Internal CA/O=Empresa/C=BR"
+
+# Criar o Secret com a CA no cluster
+kubectl create secret tls internal-ca-secret \
+  --cert=ca.crt \
+  --key=ca.key \
+  --namespace cert-manager
+```
+
+#### Passo 2 — Criar o CA Issuer
+
+```yaml
+# clusterissuer-ca-interna.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ca-interna
+spec:
+  ca:
+    secretName: internal-ca-secret    # Secret criado acima
+```
+
+#### Passo 3 — Distribuir a CA para os clientes
+
+Para que navegadores e outros serviços confiem nos certificados emitidos pela CA interna:
+
+```bash
+# Em máquinas Linux (Ubuntu/Debian)
+sudo cp ca.crt /usr/local/share/ca-certificates/empresa-ca.crt
+sudo update-ca-certificates
+
+# Em nós do Kubernetes (containerd)
+sudo cp ca.crt /etc/containerd/certs.d/empresa-ca.crt
+sudo systemctl restart containerd
+```
+
+---
+
+### Vault PKI Issuer
+
+Integra com o engine PKI do HashiCorp Vault para emitir certificados de curta duração:
+
+```yaml
+# clusterissuer-vault-pki.yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: vault-pki
+spec:
+  vault:
+    server: https://vault.empresa.com.br
+    path: pki/sign/minha-app-role     # Caminho do role PKI no Vault
+    caBundle: "<BASE64-DO-CA-VAULT>"
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: cert-manager-role
+        secretRef:
+          name: cert-manager-vault-sa-token
+          key: token
+```
+
+---
+
+## Certificate — Solicitando Certificados Explicitamente
+
+O recurso `Certificate` declara explicitamente o certificado que você quer. O cert-manager o emite e armazena no Secret especificado.
+
+### Certificado simples
+
+```yaml
+# certificate-minha-app.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: minha-app-tls
+  namespace: producao
+spec:
+  secretName: minha-app-tls-secret     # Secret onde o certificado será armazenado
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: minha-app.empresa.com.br
+  dnsNames:
+    - minha-app.empresa.com.br
+  duration: 2160h                       # 90 dias (padrão Let's Encrypt)
+  renewBefore: 720h                     # Renovar 30 dias antes do vencimento
+```
+
+### Certificado wildcard
+
+```yaml
+# certificate-wildcard.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: empresa-wildcard-tls
+  namespace: producao
+spec:
+  secretName: empresa-wildcard-tls-secret
+  issuerRef:
+    name: letsencrypt-prod-dns         # Deve ser DNS-01 para wildcard
+    kind: ClusterIssuer
+  commonName: "*.empresa.com.br"
+  dnsNames:
+    - "*.empresa.com.br"
+    - empresa.com.br                   # Apex domain separado (não coberto pelo wildcard)
+  duration: 2160h
+  renewBefore: 720h
+```
+
+### Certificado com múltiplos SANs (Subject Alternative Names)
+
+```yaml
+# certificate-multi-san.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: multi-dominio-tls
+  namespace: producao
+spec:
+  secretName: multi-dominio-tls-secret
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - app.empresa.com.br
+    - api.empresa.com.br
+    - admin.empresa.com.br
+    - www.empresa.com.br
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA               # Alternativa: RSA (padrão)
+    size: 256                      # P-256 — mais rápido que RSA-2048
+    rotationPolicy: Always         # Gera nova chave privada a cada renovação
+```
+
+### Certificado para uso interno (CA interna, curta duração)
+
+```yaml
+# certificate-servico-interno.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pagamentos-service-tls
+  namespace: producao
+spec:
+  secretName: pagamentos-service-tls-secret
+  issuerRef:
+    name: ca-interna
+    kind: ClusterIssuer
+  commonName: pagamentos-service.producao.svc.cluster.local
+  dnsNames:
+    - pagamentos-service
+    - pagamentos-service.producao
+    - pagamentos-service.producao.svc
+    - pagamentos-service.producao.svc.cluster.local
+  duration: 168h                   # 7 dias — curta duração para serviços internos
+  renewBefore: 24h                 # Renovar 24h antes
+  usages:
+    - server auth
+    - client auth                  # Para mTLS bidirecional
+```
+
+---
+
+## Integração com Ingress (anotação automática)
+
+A forma mais simples: basta anotar o Ingress e o cert-manager emite e renova o certificado automaticamente.
+
+### NGINX Ingress
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minha-app-ingress
+  namespace: producao
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"   # ← cert-manager gerencia tudo
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - minha-app.empresa.com.br
+      secretName: minha-app-tls-secret   # cert-manager cria e preenche este Secret
+  rules:
+    - host: minha-app.empresa.com.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minha-app-service
+                port:
+                  number: 80
+```
+
+### Traefik (IngressRoute + Certificate separado)
+
+Com Traefik usando CRDs, declare o `Certificate` separado e referencie o Secret no `IngressRoute`:
+
+```yaml
+# certificate para o Traefik
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: minha-app-tls
+  namespace: producao
+spec:
+  secretName: minha-app-tls-secret
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - minha-app.empresa.com.br
+---
+# IngressRoute usando o Secret gerenciado pelo cert-manager
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: minha-app
+  namespace: producao
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`minha-app.empresa.com.br`)
+      kind: Rule
+      services:
+        - name: minha-app-service
+          port: 80
+  tls:
+    secretName: minha-app-tls-secret    # Secret preenchido pelo cert-manager
+```
+
+---
+
+## Monitorar o Status dos Certificados
+
+```bash
+# Listar todos os certificados e seus status
+kubectl get certificate -n producao
+
+# Saída esperada:
+# NAME               READY   SECRET                    AGE
+# minha-app-tls      True    minha-app-tls-secret      5d
+# empresa-wildcard   True    empresa-wildcard-secret   2d
+
+# Descrever um certificado (ver datas, renovação, condições)
+kubectl describe certificate minha-app-tls -n producao
+
+# Ver CertificateRequests (histórico de emissões)
+kubectl get certificaterequest -n producao
+
+# Ver Orders ACME em andamento
+kubectl get order -n producao
+
+# Ver Challenges (diagnóstico de falhas de validação)
+kubectl get challenge -n producao
+kubectl describe challenge <nome> -n producao
+
+# Inspecionar o Secret gerado
+kubectl get secret minha-app-tls-secret -n producao -o yaml
+kubectl get secret minha-app-tls-secret -n producao \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout \
+  | grep -E "Subject|DNS|Not Before|Not After"
+```
+
+---
+
+## Debugging de Falhas
+
+O fluxo de emissão tem 4 etapas — cada uma com seu recurso rastreável:
+
+```
+Certificate → CertificateRequest → Order → Challenge
+```
+
+```bash
+# 1. Certificado com READY=False?
+kubectl describe certificate minha-app-tls -n producao
+# Checar: Conditions, Events
+
+# 2. Ver o CertificateRequest gerado
+kubectl get certificaterequest -n producao
+kubectl describe certificaterequest minha-app-tls-xxxx -n producao
+
+# 3. Ver a Order ACME
+kubectl get order -n producao
+kubectl describe order minha-app-tls-xxxx -n producao
+# Checar: Status, Reason
+
+# 4. Ver o Challenge (onde geralmente está a falha)
+kubectl get challenge -n producao
+kubectl describe challenge minha-app-tls-xxxx-0 -n producao
+# Checar: Reason, Message
+
+# Logs do cert-manager (mais detalhes)
+kubectl logs -n cert-manager \
+  -l app.kubernetes.io/name=cert-manager \
+  --tail=100 -f
+```
+
+### Falhas comuns e soluções
+
+<AccordionGroup>
+  <Accordion title="Challenge HTTP-01 falha — ACME não consegue acessar o endpoint">
+    O cert-manager cria um Ingress temporário em `/.well-known/acme-challenge/`. Verifique:
+    - O domínio resolve para o IP do Ingress Controller
+    - A porta 80 está acessível externamente
+    - Não há redirect HTTP→HTTPS antes do desafio ser validado
+    - O `ingressClassName` no solver bate com o Ingress Controller instalado
+
+    ```bash
+    # Testar manualmente
+    curl http://minha-app.empresa.com.br/.well-known/acme-challenge/test
+    ```
+  </Accordion>
+
+  <Accordion title="Rate limit da Let's Encrypt atingido">
+    Limite: 5 certificados idênticos por semana. Use **staging** para testes:
+
+    ```yaml
+    issuerRef:
+      name: letsencrypt-staging    # Sem limite de rate
+      kind: ClusterIssuer
+    ```
+    Após validar, troque para `letsencrypt-prod` e delete o Secret para forçar reemissão.
+  </Accordion>
+
+  <Accordion title="Certificate com READY=False após renovação">
+    Delete o Secret — o cert-manager emite um novo:
+
+    ```bash
+    kubectl delete secret minha-app-tls-secret -n producao
+    # cert-manager emite automaticamente em segundos
+    kubectl get certificate minha-app-tls -n producao -w
+    ```
+  </Accordion>
+
+  <Accordion title="DNS-01 falha — registro TXT não propagado">
+    O cert-manager aguarda a propagação do DNS antes de notificar a ACME. Configure o `dnsPropagationPolicy` para aguardar propagação global:
+
+    ```yaml
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+          cnameStrategy: Follow
+    ```
+    Verifique manualmente:
+    ```bash
+    dig TXT _acme-challenge.minha-app.empresa.com.br
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Renovação Automática
+
+O cert-manager monitora **todos** os Certificates e inicia a renovação automaticamente quando resta o tempo definido em `renewBefore` (padrão: 1/3 da duração total).
+
+```
+Emissão ──────────────────────────── Vencimento
+   │                       │              │
+   │←────── 60 dias ───────│←── 30 dias ─│
+   │                  cert-manager inicia │
+   │                  renovação aqui      │
+```
+
+Você não precisa fazer nada — a renovação acontece sem downtime. O Secret é atualizado em background e o Ingress Controller lê o novo certificado automaticamente.
+
+---
+
+## Boas Práticas
+
+<AccordionGroup>
+  <Accordion title="Use um ClusterIssuer por ambiente">
+    Separe claramente staging de produção. Nunca use staging em produção — o certificado não será confiável pelos navegadores.
+  </Accordion>
+
+  <Accordion title="Prefira DNS-01 para wildcards e ambientes internos">
+    HTTP-01 expõe seu cluster à internet durante o desafio. DNS-01 é mais seguro e o único que suporta `*.empresa.com.br`.
+  </Accordion>
+
+  <Accordion title="Monitore a expiração dos certificados com Prometheus">
+    O cert-manager expõe a métrica `certmanager_certificate_expiration_timestamp_seconds`. Configure alertas para certificados com menos de 14 dias:
+
+    ```yaml
+    # Alerta Prometheus
+    - alert: CertificadoExpirando
+      expr: |
+        (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 14
+      for: 1h
+      labels:
+        severity: warning
+      annotations:
+        summary: "Certificado {{ $labels.name }} expira em {{ $value | humanizeDuration }}"
+    ```
+  </Accordion>
+
+  <Accordion title="Use rotationPolicy: Always para chaves privadas">
+    Gera uma nova chave a cada renovação, reduzindo a janela de exposição caso uma chave vazada não seja detectada imediatamente.
+
+    ```yaml
+    spec:
+      privateKey:
+        rotationPolicy: Always
+    ```
+  </Accordion>
+</AccordionGroup>
